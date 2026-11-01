@@ -105,10 +105,10 @@ private:
             pos = eol + 2;
           }
         }
-        if (content_length > 64 * 1024 * 1024) {
+        if (content_length > 8 * 1024 * 1024) {
           Ctx err;
           err.set_status(413);
-          err.set_content(R"({"error":{"message":"payload too large"}})", "application/json");
+          err.set_content(R"({"error":{"message":"payload too large (8MB limit) - reduce conversation history"}})", "application/json");
           co_await write_simple(*sock, err, false);
           break;
         }
