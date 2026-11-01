@@ -21,6 +21,7 @@ public:
       ctx.set_content(anthropic_error("invalid JSON body").dump(), "application/json");
       co_return;
     }
+    std::string().swap(ctx.body); // 原始 body 已解析进 DOM：立即释放（1M 上下文时省一整份）
     std::string session_key;
     if (ctx_.routing.mode() == "cache") session_key = domain::affinity_key(body);
     auto t0 = std::chrono::steady_clock::now();

@@ -48,14 +48,15 @@ public:
     }
     std::string raw_model = openai_body.value("model", std::string());
     std::string model = protocol::map_model(ctx_.modelmap, ctx_.cfg.default_model, raw_model);
-    nlohmann::json anthropic_body = protocol::translate_request(openai_body, model);
+    std::string().swap(ctx.body); // 原始 body 已解析进 DOM：立即释放（1M 上下文时省一整份）
+    nlohmann::json anthropic_body = protocol::translate_request(std::move(openai_body), model);
     std::string id = "chatcmpl-" + util::uuid();
     std::string session_key;
     if (ctx_.routing.mode() == "cache") session_key = domain::affinity_key(anthropic_body);
     auto t0 = std::chrono::steady_clock::now();
 
-    if (anthropic_body.value("stream", false)) co_await stream_chat(ctx, anthropic_body, model, id, session_key, t0);
-    else co_await plain_chat(ctx, anthropic_body, model, id, session_key, t0);
+    if (anthropic_body.value("stream", false)) co_await stream_chat(ctx, std::move(anthropic_body), model, id, session_key, t0);
+    else co_await plain_chat(ctx, std::move(anthropic_body), model, id, session_key, t0);
   }
 
 private:
@@ -64,7 +65,7 @@ private:
   }
 
   // ---------- 流式：上游 chunk 协程直通 ----------
-  asio::awaitable<void> stream_chat(http::Ctx& ctx, const nlohmann::json& anthropic_body,
+  asio::awaitable<void> stream_chat(http::Ctx& ctx, nlohmann::json anthropic_body,
                                     const std::string& model, const std::string& id,
                                     const std::string& session_key, std::chrono::steady_clock::time_point t0) {
     const std::string out_model = model;
@@ -203,7 +204,7 @@ private:
   }
 
   // ---------- 非流式 ----------
-  asio::awaitable<void> plain_chat(http::Ctx& ctx, const nlohmann::json& anthropic_body,
+  asio::awaitable<void> plain_chat(http::Ctx& ctx, nlohmann::json anthropic_body,
                                    const std::string& model, const std::string& id,
                                    const std::string& session_key, std::chrono::steady_clock::time_point t0) {
     auto call = co_await ctx_.client.call_co(anthropic_body, session_key, "", nullptr);

@@ -46,7 +46,7 @@ inline std::string client_system_to_text(const nlohmann::json& system) {
   return "";
 }
 
-inline nlohmann::json with_injected_system(const nlohmann::json& body,
+inline nlohmann::json with_injected_system(nlohmann::json body,
                                            const std::vector<nlohmann::json>& required_blocks) {
   // system = [ZCode身份块, ZCode主段(会话路径随机化), ...客户端system块]
   // 消融实验：WAF 要求前两块开头（缺一 405），客户端块可追加尾部；第三块非必须
@@ -74,18 +74,17 @@ inline nlohmann::json with_injected_system(const nlohmann::json& body,
   }
   // 客户端 system（string 或 blocks 数组）追加尾部——客户端提示词升格为 system
   if (body.contains("system") && !body["system"].is_null()) {
-    const auto& cs = body["system"];
+    auto& cs = body["system"];
     if (cs.is_string() && !cs.get<std::string>().empty())
-      sys.push_back({{"type", "text"}, {"text", cs.get<std::string>()}});
+      sys.push_back({{"type", "text"}, {"text", std::move(cs.get_ref<std::string&>())}});
     else if (cs.is_array())
-      for (auto& b : cs) if (b.is_object()) sys.push_back(b);
+      for (auto& b : cs) if (b.is_object()) sys.push_back(std::move(b));
   }
   if (!sys.empty()) sys[sys.size() - 1]["cache_control"] = {{"type", "ephemeral"}};
 
-  nlohmann::json out = body;
+  nlohmann::json out = std::move(body); // 大 body（1M 上下文）：接管输入树，避免整树深拷贝
   out["system"] = std::move(sys);
-  out["messages"] = body.contains("messages") && body["messages"].is_array()
-                        ? body["messages"] : nlohmann::json::array();
+  if (!out.contains("messages") || !out["messages"].is_array()) out["messages"] = nlohmann::json::array();
   return out;
 }
 
@@ -176,15 +175,17 @@ public:
     int tries = std::max((int)pool_.size(), 1);
     int had_status = 0;
     std::string last_content_type;
+    const std::string payload_model = payload.value("model", std::string());
+    std::string body_str = payload.dump(); // 只 dump 一次（此前每个账号尝试都重 dump 全量 body）
+    payload = nlohmann::json();            // payload DOM 立即释放：上游流式期间只留 body_str
     for (int i = 0; i < tries; i++) {
-      auto name = pool_.pick(session_key, avoid_name, payload.value("model", ""));
+      auto name = pool_.pick(session_key, avoid_name, payload_model);
       if (!name) { out.no_account = true; break; }
       auto lease = pool_.lease(*name);
       if (!lease.valid) break;
       out.account_name = *name;
       Headers headers = combine_zcode_endpoint(build_upstream_caller(lease), lease.jwt, lease.device_mid,
                                                lease.app_version);
-      std::string body_str = payload.dump();
       auto t0 = std::chrono::steady_clock::now();
       auto res = co_await zhttp::co_post_stream(cfg_.upstream, zhttp::full_path(cfg_.upstream, "/v1/messages"), headers, body_str, on_chunk);
       int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -219,7 +220,7 @@ public:
           }
         }
         if (res.status == 429) {
-          pool_.mark_cooldown(*name, cfg_.cooldown_429_ms, payload.value("model", ""));
+          pool_.mark_cooldown(*name, cfg_.cooldown_429_ms, payload_model);
           continue;
         }
       }
@@ -233,7 +234,7 @@ public:
           int64_t code = 0;
           try { code = j["code"].get<int64_t>(); } catch (...) {}
           if (code == 1005 || code == 1113 || code == 1302) {
-            pool_.mark_cooldown(*name, cfg_.cooldown_429_ms, payload.value("model", ""));
+            pool_.mark_cooldown(*name, cfg_.cooldown_429_ms, payload_model);
             continue;
           }
           out.status = res.status; out.content_type = res.content_type; out.body = res.body;
@@ -263,15 +264,17 @@ public:
     int tries = std::max((int)pool_.size(), 1);
     int had_status = 0;
     std::string last_content_type;
+    const std::string payload_model = payload.value("model", std::string());
+    std::string body_str = payload.dump(); // 只 dump 一次（此前每个账号尝试都重 dump 全量 body）
+    payload = nlohmann::json();            // payload DOM 立即释放：上游流式期间只留 body_str
     for (int i = 0; i < tries; i++) {
-      auto name = pool_.pick(session_key, avoid_name, payload.value("model", ""));
+      auto name = pool_.pick(session_key, avoid_name, payload_model);
       if (!name) { out.no_account = true; break; }
       auto lease = pool_.lease(*name);
       if (!lease.valid) break;
       out.account_name = *name;
       Headers headers = combine_zcode_endpoint(build_upstream_caller(lease), lease.jwt, lease.device_mid,
                                                lease.app_version);
-      std::string body_str = payload.dump();
       // 调试转储（重放定位用）：ZPROXY_DUMP_REQUEST=1 时写 /tmp/zproxy-last-req.json
       if (util::fs::getenv_str("ZPROXY_DUMP_REQUEST")) {
         nlohmann::json dump;
@@ -324,7 +327,7 @@ public:
           if (res.status != 429) { /* 3009 期恢复 */ }
         }
         if (res.status == 429) {
-          pool_.mark_cooldown(*name, cfg_.cooldown_429_ms, payload.value("model", ""));
+          pool_.mark_cooldown(*name, cfg_.cooldown_429_ms, payload_model);
           continue;
         }
       }
@@ -339,7 +342,7 @@ public:
           int64_t code = 0;
           try { code = j["code"].get<int64_t>(); } catch (...) {}
           if (code == 1005 || code == 1113 || code == 1302) {
-            pool_.mark_cooldown(*name, cfg_.cooldown_429_ms, payload.value("model", ""));
+            pool_.mark_cooldown(*name, cfg_.cooldown_429_ms, payload_model);
             continue;
           }
           out.status = res.status; out.content_type = std::move(res.content_type); out.body = std::move(res.body);

@@ -6,7 +6,6 @@
 #pragma once
 #include <cmath>
 #include <optional>
-#include <regex>
 #include <string>
 #include "nlohmann/json.hpp"
 #include "util/uuid.hpp"
@@ -15,30 +14,40 @@ namespace zproxy::protocol {
 
 constexpr int64_t kMaxTokensCap = 131072;
 
-inline nlohmann::json text_blocks_from_content(const nlohmann::json& content) {
+// data:image/png;base64,XXXX → (media_type, data)
+// 手工解析替代 std::regex：base64 图片动辄数 MB，regex 在其上又慢又耗内存
+inline bool parse_data_url(const std::string& url, std::string& media, std::string& data) {
+  if (url.compare(0, 5, "data:") != 0) return false;
+  auto sep = url.find(";base64,", 5);
+  if (sep == std::string::npos) return false;
+  media = url.substr(5, sep - 5);
+  data = url.substr(sep + 8);
+  return media.compare(0, 6, "image/") == 0 && !data.empty();
+}
+
+// 按 move 语义从 content 搬运字符串（调用方传入的节点随后即弃）
+inline nlohmann::json text_blocks_from_content(nlohmann::json content) {
   nlohmann::json blocks = nlohmann::json::array();
   if (content.is_string()) {
-    std::string t = content.get<std::string>();
-    if (!t.empty()) blocks.push_back({{"type", "text"}, {"text", t}});
+    if (!content.get<std::string>().empty())
+      blocks.push_back({{"type", "text"}, {"text", std::move(content.get_ref<std::string&>())}});
     return blocks;
   }
   if (!content.is_array()) return blocks;
-  static const std::regex data_url_re("^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$", std::regex::extended);
   for (auto& part : content) {
     if (!part.is_object()) continue;
     std::string type = part.value("type", "");
     if (type == "text") {
       if (part.contains("text") && part["text"].is_string() && !part["text"].get<std::string>().empty())
-        blocks.push_back({{"type", "text"}, {"text", part["text"]}});
+        blocks.push_back({{"type", "text"}, {"text", std::move(part["text"].get_ref<std::string&>())}});
     } else if (type == "image_url") {
-      std::string url;
       if (part.contains("image_url") && part["image_url"].is_object() &&
-          part["image_url"].contains("url") && part["image_url"]["url"].is_string())
-        url = part["image_url"]["url"].get<std::string>();
-      std::smatch m;
-      if (std::regex_search(url, m, data_url_re) && m.size() == 3) {
-        blocks.push_back({{"type", "image"},
-                          {"source", {{"type", "base64"}, {"media_type", m[1].str()}, {"data", m[2].str()}}}});
+          part["image_url"].contains("url") && part["image_url"]["url"].is_string()) {
+        std::string url = std::move(part["image_url"]["url"].get_ref<std::string&>());
+        std::string media, data;
+        if (parse_data_url(url, media, data))
+          blocks.push_back({{"type", "image"},
+                            {"source", {{"type", "base64"}, {"media_type", std::move(media)}, {"data", std::move(data)}}}});
       }
       // 非 data URL 与其他类型：静默丢弃（对齐 Node）
     }
@@ -46,7 +55,8 @@ inline nlohmann::json text_blocks_from_content(const nlohmann::json& content) {
   return blocks;
 }
 
-inline nlohmann::json translate_request(const nlohmann::json& in, const std::string& mapped_model) {
+// 按 move 语义消费 in：消息文本/base64/工具 schema 从输入树搬出，全程只保留一份
+inline nlohmann::json translate_request(nlohmann::json in, const std::string& mapped_model) {
   nlohmann::json out;
   out["model"] = mapped_model;
   out["stream"] = in.value("stream", false);
@@ -66,27 +76,29 @@ inline nlohmann::json translate_request(const nlohmann::json& in, const std::str
       if (role == "system" || role == "developer") {
         if (msg.contains("content")) {
           if (msg["content"].is_string()) {
-            append_instruction_prefix(msg["content"].get<std::string>());
+            append_instruction_prefix(std::move(msg["content"].get_ref<std::string&>()));
           } else if (msg["content"].is_array()) {
             for (auto& b : msg["content"]) {
               if (b.is_object() && b.value("type", "") == "text" && b.contains("text"))
-                append_instruction_prefix(b["text"].get<std::string>());
+                append_instruction_prefix(std::move(b["text"].get_ref<std::string&>()));
             }
           }
         }
         continue;
       }
       if (role == "user") {
-        auto blocks = text_blocks_from_content(msg.contains("content") ? msg["content"] : nlohmann::json(nullptr));
-        messages.push_back({{"role", "user"}, {"content", blocks}});
+        nlohmann::json blocks;
+        if (msg.contains("content")) blocks = text_blocks_from_content(std::move(msg["content"]));
+        else blocks = text_blocks_from_content(nullptr);
+        messages.push_back({{"role", "user"}, {"content", std::move(blocks)}});
       } else if (role == "assistant") {
         nlohmann::json blocks = nlohmann::json::array();
         if (msg.contains("reasoning_content") && msg["reasoning_content"].is_string() &&
             !msg["reasoning_content"].get<std::string>().empty()) {
-          blocks.push_back({{"type", "thinking"}, {"thinking", msg["reasoning_content"]}, {"signature", ""}});
+          blocks.push_back({{"type", "thinking"}, {"thinking", std::move(msg["reasoning_content"])}, {"signature", ""}});
         }
         if (msg.contains("content")) {
-          auto tb = text_blocks_from_content(msg["content"]);
+          auto tb = text_blocks_from_content(std::move(msg["content"]));
           blocks.insert(blocks.end(), tb.begin(), tb.end());
         }
         if (msg.contains("tool_calls") && msg["tool_calls"].is_array()) {
@@ -96,7 +108,9 @@ inline nlohmann::json translate_request(const nlohmann::json& in, const std::str
             nlohmann::json input = nlohmann::json::object();
             if (tc.contains("function") && tc["function"].is_object()) {
               name = tc["function"].value("name", "");
-              std::string args = tc["function"].value("arguments", std::string("{}"));
+              std::string args = "{}";
+              if (tc["function"].contains("arguments") && tc["function"]["arguments"].is_string())
+                args = std::move(tc["function"]["arguments"].get_ref<std::string&>());
               if (args.empty()) args = "{}";
               try { input = nlohmann::json::parse(args); if (!input.is_object()) input = nlohmann::json::object(); }
               catch (...) { input = nlohmann::json::object(); }
@@ -109,7 +123,8 @@ inline nlohmann::json translate_request(const nlohmann::json& in, const std::str
         if (!blocks.empty()) messages.push_back({{"role", "assistant"}, {"content", blocks}});
       } else if (role == "tool") {
         std::string text;
-        if (msg.contains("content") && msg["content"].is_string()) text = msg["content"].get<std::string>();
+        if (msg.contains("content") && msg["content"].is_string())
+          text = std::move(msg["content"].get_ref<std::string&>());
         messages.push_back({
           {"role", "user"},
           {"content", nlohmann::json::array({{{"type", "tool_result"},
@@ -122,8 +137,8 @@ inline nlohmann::json translate_request(const nlohmann::json& in, const std::str
   // system_text 已在消息循环内收集完毕（append_instruction_prefix 现为收集函数，
   // 此处旧残留调用曾把文本追加进自身——"be nice\n\nbe nice" 双倍即由此来）
   if (!system_text.empty())
-    out["system"] = nlohmann::json::array({{{"type", "text"}, {"text", system_text}}});
-  out["messages"] = messages;
+    out["system"] = nlohmann::json::array({{{"type", "text"}, {"text", std::move(system_text)}}});
+  out["messages"] = std::move(messages);
 
   // max_tokens：max_completion_tokens ?? max_tokens，cap 131072，默认 8192
   int64_t mt = 8192;
@@ -138,12 +153,12 @@ inline nlohmann::json translate_request(const nlohmann::json& in, const std::str
   }
   out["max_tokens"] = mt;
 
-  if (in.contains("temperature") && !in["temperature"].is_null()) out["temperature"] = in["temperature"];
-  if (in.contains("top_p") && !in["top_p"].is_null()) out["top_p"] = in["top_p"];
+  if (in.contains("temperature") && !in["temperature"].is_null()) out["temperature"] = std::move(in["temperature"]);
+  if (in.contains("top_p") && !in["top_p"].is_null()) out["top_p"] = std::move(in["top_p"]);
 
   if (in.contains("stop") && !in["stop"].is_null()) {
-    if (in["stop"].is_string()) out["stop_sequences"] = nlohmann::json::array({in["stop"]});
-    else if (in["stop"].is_array()) out["stop_sequences"] = in["stop"];
+    if (in["stop"].is_string()) out["stop_sequences"] = nlohmann::json::array({std::move(in["stop"])});
+    else if (in["stop"].is_array()) out["stop_sequences"] = std::move(in["stop"]);
   }
 
   if (in.contains("tools") && in["tools"].is_array()) {
@@ -151,16 +166,17 @@ inline nlohmann::json translate_request(const nlohmann::json& in, const std::str
     for (auto& t : in["tools"]) {
       if (!t.is_object()) continue;
       nlohmann::json fn = nullptr;
-      if (t.value("type", "") == "function" && t.contains("function") && t["function"].is_object()) fn = t["function"];
-      else if (t.contains("function") && t["function"].is_object()) fn = t["function"];
-      else if (t.contains("name")) fn = t;
+      if (t.value("type", "") == "function" && t.contains("function") && t["function"].is_object())
+        fn = std::move(t["function"]);
+      else if (t.contains("function") && t["function"].is_object()) fn = std::move(t["function"]);
+      else if (t.contains("name")) fn = std::move(t);
       if (fn.is_null() || !fn.contains("name")) continue;
       nlohmann::json schema = nlohmann::json{{"type", "object"}, {"properties", nlohmann::json::object()}};
-      if (fn.contains("parameters") && fn["parameters"].is_object()) schema = fn["parameters"];
+      if (fn.contains("parameters") && fn["parameters"].is_object()) schema = std::move(fn["parameters"]);
       tools.push_back({
-        {"name", fn["name"]},
+        {"name", std::move(fn["name"])},
         {"description", fn.value("description", "")},
-        {"input_schema", schema},
+        {"input_schema", std::move(schema)},
       });
     }
     if (!tools.empty()) out["tools"] = tools;
