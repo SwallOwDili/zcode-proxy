@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>注入提示词 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css"></head>
+<body>
+<div class="toast" id="toast"></div>
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("sysprompt", "注入提示词", "编辑注入给上游的 system 块（WAF 校验块结构，至少 2 个文本块）");
+const C = document.getElementById("pageContent");
+C.innerHTML = `
+  <section class="card">
+    <h2><span class="ico">✏️</span>注入提示词编辑</h2>
+    <label style="display:block;margin:12px 0 4px">块 1（身份块）</label>
+    <textarea id="b0" rows="3" style="width:100%;font-family:monospace;font-size:12px"></textarea>
+    <label style="display:block;margin:12px 0 4px">块 2（主段）</label>
+    <textarea id="b1" rows="18" style="width:100%;font-family:monospace;font-size:12px"></textarea>
+    <div style="margin-top:12px"><button id="save">保存（热生效）</button>
+    <button id="reset">恢复自动提取</button>
+    <span id="msg" class="muted" style="margin-left:12px"></span></div>
+  </section>`;
+async function load() {
+  try {
+    const d = await api("/admin/sysprompt");
+    const bs = d.blocks ?? [];
+    document.getElementById("b0").value = bs[0]?.text ?? "";
+    document.getElementById("b1").value = bs.slice(1).map(b => b.text).join("\n\n");
+  } catch (e) { document.getElementById("msg").textContent = "加载失败: " + e.message; }
+}
+document.getElementById("save").onclick = async () => {
+  try {
+    const b0 = document.getElementById("b0").value.trim();
+    const b1 = document.getElementById("b1").value.trim();
+    await api("/admin/sysprompt", { method: "PUT", body: JSON.stringify({ blocks: [
+      { type: "text", text: b0 }, { type: "text", text: b1 }] }) });
+    document.getElementById("msg").textContent = "✅ 已保存并热生效";
+  } catch (e) { document.getElementById("msg").textContent = "❌ " + e.message; }
+};
+document.getElementById("reset").onclick = async () => {
+  try {
+    await api("/admin/sysprompt", { method: "PUT", body: JSON.stringify({ blocks: [] }) });
+    document.getElementById("msg").textContent = "已恢复自动提取";
+    load();
+  } catch (e) { document.getElementById("msg").textContent = "❌ " + e.message; }
+};
+load();
+</script>
+</body></html>

@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模型映射 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div class="toast" id="toast"></div>
+
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("models", "模型映射", "请求里的模型别名 → 上游真实模型");
+
+const C = document.getElementById("pageContent");
+let mapDraft = null;
+let mapLoadedKeys = [];
+
+C.innerHTML = `
+  <section class="card">
+    <h2><span class="ico">🔀</span>映射表
+      <span class="tools">
+        <button onclick="addMapRow()">＋ 添加</button>
+        <button class="primary" onclick="saveMap()">保存</button>
+      </span>
+    </h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>别名（请求里的模型名，精确匹配）</th><th style="width:240px">上游模型</th><th style="width:80px"></th></tr></thead>
+        <tbody id="mapRows"></tbody>
+      </table>
+    </div>
+    <div class="hint">
+      未命中别名且不以 GLM 开头的模型名，回落到默认模型。保存写入 model-map.json 并<b>立即生效，无需重启</b>；删除内置别名等效于将其移除。
+    </div>
+  </section>`;
+
+async function loadMap() {
+  try {
+    const r = await api("/admin/modelmap");
+    mapDraft = { ...r.map };
+    mapLoadedKeys = Object.keys(r.map);
+    renderMap();
+  } catch (e) { toast(e.message, true); }
+}
+
+function renderMap() {
+  const tb = document.getElementById("mapRows");
+  tb.innerHTML = "";
+  for (const [k, v] of Object.entries(mapDraft)) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td><input type="text" class="mk" value="${esc(k)}"></td>
+      <td><select class="mv">${["GLM-5.3-Flash", "GLM-5.3"].map((m) => `<option${m === v ? " selected" : ""}>${m}</option>`).join("")}</select></td>
+      <td><button class="danger" onclick="this.closest('tr').remove()">删除</button></td>`;
+    tb.appendChild(tr);
+  }
+}
+
+function addMapRow() {
+  const tb = document.getElementById("mapRows");
+  const tr = document.createElement("tr");
+  tr.innerHTML = `
+    <td><input type="text" class="mk" placeholder="别名"></td>
+    <td><select class="mv"><option>GLM-5.3-Flash</option><option>GLM-5.3</option></select></td>
+    <td><button class="danger" onclick="this.closest('tr').remove()">删除</button></td>`;
+  tb.appendChild(tr);
+}
+
+async function saveMap() {
+  const map = {};
+  const present = new Set();
+  for (const tr of document.querySelectorAll("#mapRows tr")) {
+    const k = tr.querySelector(".mk").value.trim();
+    const v = tr.querySelector(".mv").value;
+    if (!k) continue;
+    present.add(k);
+    map[k] = v;
+  }
+  for (const k of mapLoadedKeys) if (!present.has(k) && map[k] === undefined) map[k] = null;
+  try {
+    const r = await api("/admin/modelmap", { method: "PUT", body: JSON.stringify({ map }) });
+    mapDraft = { ...r.map };
+    mapLoadedKeys = Object.keys(r.map).filter((k) => r.map[k] != null);
+    renderMap();
+    toast("模型映射已保存，立即生效");
+  } catch (e) { toast(e.message, true); }
+}
+
+loadMap();
+</script>
+</body>
+</html>

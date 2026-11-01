@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>添加 / 登录 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div class="toast" id="toast"></div>
+
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("add-account", "添加 / 登录", "三种方式把账号接入代理池");
+
+// 新号入池标准流程（重要）：新注册的账号必须先在 ZCode App 里真实登录一次，
+// 否则：① 每日/周末活动领取会被 3012 风控拦截 ② 邀请新手任务「登录客户端」永不完成。
+// App 登录一次 = 账号获得"可信客户端"标记 = 之后所有自动化全部畅通（一次登录，终身有效）。
+// 流程：App 设置 → 账号 → 登出当前号 → 用新号登录（Google/邮箱）→ 等主界面加载完 → 回来本页用方式三导入。
+const INGEST_HINT = `
+  <section class="card" style="border-left:3px solid #f59e0b;margin-bottom:14px">
+    <div style="font-size:13px;line-height:1.7">
+      <b>⚠️ 新账号必读：先在 ZCode App 里登录一次</b>（否则每期活动领取都会被风控拦截）<br>
+      <span style="color:var(--muted,#8b95a5)">
+      没经过 App 登录的账号：每日 3 亿 / 周末 5 亿领取会被 3012 拦截、邀请任务「登录客户端」无法完成。<br>
+      <b>正确顺序</b>：① App 登出当前号 → ② 用新号登录 App（登录成功即打上可信标记）→ ③ 回本页用「方式三 · Cookie 登录」导入池子。<br>
+      一次登录，终身有效。跳过这一步，后面所有自动化都要人工救火。
+      </span>
+    </div>
+  </section>`;
+setTimeout(() => {
+  const first = document.querySelector(".card");
+  if (first && !document.getElementById("ingestHint")) {
+    const div = document.createElement("div");
+    div.innerHTML = INGEST_HINT;
+    div.firstElementChild.id = "ingestHint";
+    first.parentNode.insertBefore(div.firstElementChild, first);
+  }
+}, 50);
+
+const C = document.getElementById("pageContent");
+const params = new URLSearchParams(location.search);
+const EDITING = params.get("edit");
+let activeFlowId = null;
+let loginPoll = null;
+
+C.innerHTML = `
+  <section class="card">
+    <h2><span class="ico">🔐</span>方式一 · 页面内直接登录 Z.ai<span class="dim" style="font-weight:400;font-size:12px;">最省事，无需复制粘贴</span></h2>
+    <label class="field">账号区域</label>
+    <select id="fRegion">
+      <option value="global">🌍 全球账号（z.ai / chat.z.ai 登录）</option>
+      <option value="cn">🇨🇳 中国账号（bigmodel.cn 登录）</option>
+    </select>
+    <div class="hint" style="margin-bottom:6px;">
+      点下方按钮，在<b>新打开的页面</b>里登录<b>目标账号</b>即可——登录完成后浏览器会落在一个 chat.z.ai 页面上，<b>无需任何复制粘贴</b>，此处会自动确认并加入账号。
+    </div>
+    <button id="btnLogin" class="primary" onclick="startLogin()">① 打开 Z.ai 登录页（每次登录都要用新打开的这一页）</button>
+    <div class="hint" id="loginStatus"></div>
+    <div id="manualRow" style="display:none; margin-top:10px;">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:4px;">兜底：若 1 分钟后仍未自动完成，把最终页面的<b>完整地址</b>（含 code 和 state）粘贴到这里：</div>
+      <input type="text" id="fCode" placeholder="https://chat.z.ai/app/oauth/login?...code=...&state=..." class="mono">
+      <button class="primary" onclick="manualComplete()" style="margin-top:6px;">手动完成登录</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2><span class="ico">🍪</span>方式二 · Cookie 登录<span class="dim" style="font-weight:400;font-size:12px;">最稳，完全绕开浏览器跳转</span></h2>
+    <div class="hint" style="margin-bottom:6px;">
+      浏览器登录 chat.z.ai 后：F12 → <b>网络 / Network</b> → 刷新页面 → 点任意 chat.z.ai 请求 → 请求标头 → 复制 <b>cookie</b> 整行 → 粘贴到这里。Cookie 只在本机使用。
+    </div>
+    <input type="text" id="fCookie" placeholder="cookie: ..." class="mono">
+    <button class="primary" onclick="cookieLogin()" style="margin-top:6px;">用 Cookie 登录</button>
+    <div class="hint" id="cookieStatus"></div>
+  </section>
+
+  <section class="card">
+    <h2><span class="ico">🔑</span>方式三 · zcodejwttoken</h2>
+    <div class="hint" style="margin-bottom:6px;">
+      在已登录该账号的机器上运行 <span class="mono">node extract-token.mjs</span>，把输出的 JWT 粘贴到这里。
+    </div>
+    <input type="text" id="fJwt" placeholder="eyJhbGciOi..." class="mono">
+    <button class="primary" onclick="saveJwt()" style="margin-top:6px;" id="btnSaveJwt">保存（方式三）</button>
+  </section>
+
+  <section class="card">
+    <h2><span class="ico">📥</span>从本地凭据导入<span class="dim" style="font-weight:400;font-size:12px;">读取 ZCode 本机登录态</span></h2>
+    <div class="hint" style="margin-bottom:6px;">已在 ZCode 客户端登录过？一键把本机登录的账号导入代理池。</div>
+    <button onclick="importLocal()">从本地凭据导入</button>
+    <div class="hint" id="importStatus"></div>
+  </section>`;
+
+async function startLogin() {
+  const st = document.getElementById("loginStatus");
+  st.textContent = "初始化登录流程…";
+  try {
+    const r = await api("/admin/login/start", { method: "POST", body: JSON.stringify({ region: document.getElementById("fRegion").value }) });
+    const isCn = document.getElementById("fRegion").value === "cn";
+    st.innerHTML = `流程已创建（${isCn ? "🇨🇳 bigmodel.cn" : "🌍 chat.z.ai"}，有效至 ${new Date(r.expiresAt).toLocaleTimeString()}）。在<b>新打开的页面</b>里登录<b>目标账号</b>，登录完成后会自动加入，无需复制粘贴。`;
+    activeFlowId = r.flowId;
+    document.getElementById("manualRow").style.display = "block";
+    window.open(r.authorizeUrl, "_blank");
+    if (loginPoll) clearInterval(loginPoll);
+    loginPoll = setInterval(async () => {
+      try {
+        const s = await api(`/admin/login/status?flowId=${encodeURIComponent(r.flowId)}`);
+        if (s.done) {
+          clearInterval(loginPoll); loginPoll = null;
+          st.innerHTML = `✅ 账号 <b>${esc(s.name)}</b> 已添加（user_id=${esc(s.userId || "?")}）`;
+          toast(`账号 ${s.name} 登录成功`);
+          refreshNavBadges();
+          setTimeout(() => { location.href = "/admin/accounts.html"; }, 1200);
+        } else if (s.error) {
+          try {
+            const nr = await api("/admin/login/start", { method: "POST", body: JSON.stringify({ region: document.getElementById("fRegion").value }) });
+            r.flowId = nr.flowId; r.expiresAt = nr.expiresAt; activeFlowId = nr.flowId;
+            st.innerHTML = `之前的流程过期了——<a href="${esc(nr.authorizeUrl)}" target="_blank" style="color:var(--accent)">点此重新打开登录页</a>（30 分钟内有效），登录后此处会自动确认。`;
+          } catch (e2) { clearInterval(loginPoll); loginPoll = null; st.textContent = "❌ 续期失败：" + e2.message; }
+        } else {
+          st.textContent = `等待登录完成…（流程 ${new Date(r.expiresAt).toLocaleTimeString()} 前有效）`;
+        }
+      } catch (e) { clearInterval(loginPoll); loginPoll = null; st.textContent = "❌ " + e.message; }
+    }, 3000);
+  } catch (e) { st.textContent = "❌ " + e.message; }
+}
+
+async function manualComplete() {
+  const code = document.getElementById("fCode").value.trim();
+  if (!code) return toast("请先粘贴失败页的完整地址或 code", true);
+  try {
+    const r = await api("/admin/login/complete", { method: "POST", body: JSON.stringify({ flowId: activeFlowId, code }) });
+    toast(`✅ 账号 ${r.name} 已添加`);
+    document.getElementById("fCode").value = "";
+    document.getElementById("manualRow").style.display = "none";
+    activeFlowId = null;
+    refreshNavBadges();
+    setTimeout(() => { location.href = "/admin/accounts.html"; }, 900);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function cookieLogin() {
+  const st = document.getElementById("cookieStatus");
+  const cookie = document.getElementById("fCookie").value.trim().replace(/^cookie:\s*/i, "");
+  if (!cookie) return toast("请先粘贴 cookie", true);
+  st.textContent = "正在用 Cookie 在服务端完成 authorize…";
+  try {
+    const r = await api("/admin/login/cookie", { method: "POST", body: JSON.stringify({ cookie }) });
+    st.innerHTML = `✅ 账号 <b>${esc(r.name)}</b> 已添加`;
+    toast(`账号 ${r.name} 登录成功`);
+    document.getElementById("fCookie").value = "";
+    refreshNavBadges();
+    setTimeout(() => { location.href = "/admin/accounts.html"; }, 1200);
+  } catch (e) { st.textContent = "❌ " + e.message; }
+}
+
+async function saveJwt() {
+  const jwt = document.getElementById("fJwt").value.trim();
+  if (!EDITING && !jwt) return toast("jwt 不能为空", true);
+  try {
+    if (EDITING) {
+      const body = { region: document.getElementById("fRegion").value };
+      if (jwt) body.jwt = jwt;
+      await api(`/admin/accounts/${encodeURIComponent(EDITING)}`, { method: "PUT", body: JSON.stringify(body) });
+      toast("已保存");
+    } else {
+      await api("/admin/accounts", { method: "POST", body: JSON.stringify({ jwt, region: document.getElementById("fRegion").value }) });
+      toast("已添加");
+    }
+    document.getElementById("fJwt").value = "";
+    refreshNavBadges();
+    setTimeout(() => { location.href = "/admin/accounts.html"; }, 900);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function importLocal() {
+  const st = document.getElementById("importStatus");
+  st.textContent = "读取本地凭据中…";
+  try {
+    const r = await api("/admin/import-local", { method: "POST" });
+    st.textContent = r.imported ? "✅ 已导入本地登录的账号" : (r.message ?? "无可导入的本地登录");
+    toast(r.imported ? "已导入本地登录的账号" : (r.message ?? "无可导入的本地登录"));
+    refreshNavBadges();
+  } catch (e) { st.textContent = "❌ " + e.message; }
+}
+
+/* 编辑模式：从账号列表跳转过来 */
+if (EDITING) {
+  (async () => {
+    try {
+      const list = await api("/admin/accounts");
+      const acc = list.accounts.find((a) => a.name === EDITING);
+      if (acc) {
+        document.getElementById("fRegion").value = acc.region ?? "global";
+        document.getElementById("fJwt").placeholder = `留空保持不变（当前 ${acc.jwt.length} 字符）`;
+        document.getElementById("btnSaveJwt").textContent = "保存修改";
+        document.getElementById("importStatus").innerHTML =
+          `<b>编辑模式</b>：正在修改账号「${esc(EDITING)}」。填入新 JWT 并点「保存修改」即可覆盖，留空则保持不变。`;
+      }
+    } catch {}
+  })();
+}
+</script>
+</body>
+</html>

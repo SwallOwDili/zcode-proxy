@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>账号列表 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div class="toast" id="toast"></div>
+
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("accounts", "账号列表", "代理池中的全部账号与实时状态");
+
+const C = document.getElementById("pageContent");
+const quotaCache = new Map();
+// 额度缓存持久化到 sessionStorage：进页面先用缓存渲染，不打上游
+try {
+  const saved = JSON.parse(sessionStorage.getItem("quotaCache") ?? "{}");
+  for (const [k, v] of Object.entries(saved)) quotaCache.set(k, v);
+} catch {}
+const persistQuotaCache = () => {
+  try { sessionStorage.setItem("quotaCache", JSON.stringify(Object.fromEntries(quotaCache))); } catch {}
+};
+
+C.innerHTML = `
+  <section class="card">
+    <h2><span class="ico">👥</span>账号
+      <span class="tools">
+        <a href="/admin/add-account.html"><button>＋ 添加账号</button></a>
+        <a href="/admin/quota.html"><button>💎 额度总览</button></a>
+        <button onclick="load()">刷新</button>
+        <button id="btnRefreshQuota" onclick="refreshQuotas(true)">刷新额度</button>
+      </span>
+    </h2>
+    <div id="accRows" class="acc-grid"></div>
+    <div class="hint" id="accHint"></div>
+  </section>`;
+
+const rowsEl = document.getElementById("accRows");
+
+async function load() {
+  try {
+    const list = await api("/admin/accounts");
+    window._accs = list.accounts;
+    rowsEl.innerHTML = "";
+    for (const a of list.accounts) {
+      const div = document.createElement("div");
+      div.className = "acc-card " + (a.status === "healthy" ? "st-ok" : String(a.status).startsWith("cooldown") ? "st-warn" : "st-err");
+      const regionBadge = a.region === "cn"
+        ? '<span class="region r-cn">🇨🇳 中国</span>'
+        : '<span class="region r-global">🌍 全球</span>';
+      const avatar = a.profile?.avatar
+        ? `<img class="avt" src="${esc(a.profile.avatar)}" referrerpolicy="no-referrer">`
+        : `<span class="avt">${esc((a.profile?.name || a.name || "?").slice(0, 1).toUpperCase())}</span>`;
+      const sub = [];
+      if (a.profile?.email) sub.push(`<span>${esc(a.profile.email)}</span>`);
+      if (a.userId) sub.push(`<span class="uid">${esc(String(a.userId).slice(0, 8))}…</span>`);
+      if (a.status !== "healthy") sub.push(`<span class="status">${statusBadge(a.status)}</span>`);
+      div.innerHTML = `
+        <div class="acc-top">
+          ${avatar}
+          <div class="acc-id">
+            <div class="ident-name priv">${esc(a.profile?.name || a.name)}${regionBadge}${a.paused ? ' <span class="badge b-yellow" style="margin-left:4px">已暂停</span>' : ""}</div>
+            ${(a.profile?.name && a.profile.name !== a.name) ? `<div class="dim priv" style="font-size:11px">备注：${esc(a.name)}</div>` : ""}
+            <div class="ident-sub priv">${sub.join(" ")}</div>
+          </div>
+        </div>
+        <div class="qmini" id="qmini-${esc(a.name)}"><span class="dim" style="font-size:11px">额度加载中…</span></div>
+        <div class="refmini" id="refmini-${esc(a.name)}"><span class="dim" style="font-size:11px">邀请信息加载中…</span></div>
+        <div class="acc-jwt mono priv">${esc(maskJwt(a.jwt))}</div>
+        <div class="acc-foot">
+          <button data-act="test" data-name="${esc(a.name)}">测试</button>
+          <button data-act="plan" data-name="${esc(a.name)}">详情</button>
+          <button data-act="edit" data-name="${esc(a.name)}">编辑</button>
+          <button data-act="pause" data-name="${esc(a.name)}" data-paused="${a.paused ? 1 : 0}">${a.paused ? "恢复" : "暂停"}</button>
+          <button class="danger" data-act="del" data-name="${esc(a.name)}">删除</button>
+        </div>`;
+      rowsEl.appendChild(div);
+    }
+    if (!list.accounts.length) {
+      rowsEl.innerHTML = `<div class="empty">暂无账号——到「添加 / 登录」页添加，或在 ZCode 登录后从本地导入。</div>`;
+    }
+    document.getElementById("accHint").textContent = list.accounts.length
+      ? "轮询分摊请求；单账号 429/401 时自动切换并冷却。jwt 在 ZCode 里退出登录后会失效（持续 401）。"
+      : "";
+    refreshQuotas(false, list.accounts);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+/* ---- 额度小卡 ---- */
+function qminiHtmlFrom(pl) {
+  const activePlans = (pl.plans ?? []).filter((p) => p.status === "active");
+  let planLine = "";
+  if (activePlans.length) {
+    const ends = activePlans.map((p) => p.endsAt).filter(Boolean).sort();
+    const end = ends[0];
+    const r = remainOf(end);
+    const dColor = !r ? "var(--muted)" : r.expired ? "var(--red)" : r.totalSecs < 86400 ? "var(--yellow)" : "var(--green)";
+    const dText = !r ? "到期 ?" : `${fmtEnds(end)} · ${remainText(r)}`;
+    planLine = `<div class="qrow" style="margin-bottom:3px"><span class="qn">📅 ${esc(activePlans.map((p) => p.name).join(" / "))}</span><span class="qr" style="color:${dColor};font-size:11px">${esc(dText)}</span></div>`;
+  }
+  const groups = new Map();
+  for (const b of pl.balances ?? []) {
+    const g = groups.get(b.name) ?? { name: b.name, total: 0, used: 0, remaining: 0 };
+    g.total += b.total ?? 0; g.used += b.used ?? 0; g.remaining += b.remaining ?? 0;
+    groups.set(b.name, g);
+  }
+  const body = [...groups.values()].map((g) => {
+    const pct = g.total > 0 ? Math.max(0, Math.min(100, (g.remaining / g.total) * 100)) : 0;
+    const cls = pct > 50 ? "bar-g" : pct > 20 ? "bar-y" : "bar-r";
+    const color = pct > 50 ? "var(--green)" : pct > 20 ? "var(--yellow)" : "var(--red)";
+    return `<div class="qrow"><span class="qn">${esc(g.name)}</span><span class="qr" style="color:${color}">${fmtUnits(g.remaining)}</span></div>
+      <div class="bar ${cls}"><i style="width:${pct.toFixed(1)}%"></i></div>`;
+  }).join("") || '<span class="dim" style="font-size:11px">无额度数据</span>';
+  return planLine + body;
+}
+
+const QUOTA_CLIENT_TTL = 5 * 60_000; // 与服务端缓存同周期
+
+function refHtml(a, rf) {
+  const parts = [];
+  if (rf?.inviteLink) {
+    parts.push(`<div class="qrow"><span class="qn mono priv" style="font-size:11px">🔗 ${esc(rf.inviteLink.replace("https://", ""))}</span></div>
+      <button data-act="copyref" data-name="${esc(a.name)}" style="margin:3px 0">复制邀请链接</button>`);
+  } else if (rf && rf.inviterState === "locked" && rf.inviterUnlockedAt) {
+    parts.push(`<div class="qrow"><span class="qn dim" style="font-size:11px">🔗 邀请资格 ${new Date(rf.inviterUnlockedAt * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })} 解锁</span></div>`);
+  } else {
+    parts.push(`<div class="qrow"><span class="qn dim" style="font-size:11px">🔗 邀请信息：暂无</span></div>`);
+  }
+  if (rf?.canBind) {
+    parts.push(`<button data-act="bindref" data-name="${esc(a.name)}">接受邀请（绑定邀请码）</button>`);
+  } else if (rf?.bindDone) {
+    parts.push(`<span class="dim" style="font-size:11px">已绑定邀请（受邀完成）</span>`);
+  } else if (rf?.inviteeState === "active" && !rf?.canBind) {
+    const t = (rf.newcomerTasks ?? []).map((x) => `${x.key}${x.completed ? "✓" : ""}`).join(" / ");
+    parts.push(`<span class="dim" style="font-size:11px">新手任务：${esc(t || "—")}</span>`);
+  }
+  if (rf && rf.inviterState === "active") {
+    const det = rf.inviteesDetail ?? [];
+    const pending = det.filter((x) => !(x.tasks ?? {}).login_device).length;
+    parts.push(`<span class="dim" style="font-size:11px">已邀请 ${rf.invitedTotal} 人（本周 ${rf.invitedWeekly}）${pending ? ` · ${pending} 人待登录确认` : ""}</span>`);
+  }
+  if (rf?.invitedBy?.name) {
+    parts.push(`<div class="qrow"><span class="dim" style="font-size:11px">🤝 被邀请（邀请人 <b class="priv">${esc(rf.invitedBy.name)}</b>）</span></div>`);
+  }
+  return parts.join("");
+}
+
+const refFetchedAt = new Map(); // name -> ts，60s 内不重复打 invitees 上游
+async function refreshReferrals(accounts, force = false) {
+  const list = accounts ?? window._accs ?? [];
+  const now = Date.now();
+  for (const a of list) {
+    const el = document.getElementById(`refmini-${a.name}`);
+    if (!el) continue;
+    const c = refCache.get(a.name);
+    // 有缓存且未过期且非强制：直接重绘（页面加载/切页不重复请求）
+    if (!force && c && now - c.at < 60_000) { el.innerHTML = refHtml(a, c.data); continue; }
+    try {
+      const rf = await api(`/admin/accounts/${encodeURIComponent(a.name)}/referral${force ? "?refresh=1" : ""}`);
+      // 数据落库前先本地修正：有受邀明细时以明细数为准（上游 summary 的 total 有延迟）
+      const det = rf.inviteesDetail ?? [];
+      if (det.length && (rf.invitedTotal ?? 0) < det.length) rf.invitedTotal = det.length;
+      refCache.set(a.name, { at: Date.now(), data: rf });
+      refFetchedAt.set(a.name, Date.now());
+      el.innerHTML = refHtml(a, rf);
+    } catch (e) {
+      // 失败时退回缓存渲染，不要把卡片改成错误信息（上一次的好数据仍在）
+      if (c) el.innerHTML = refHtml(a, c.data);
+      else el.innerHTML = `<span class="dim" style="font-size:11px">邀请信息获取失败：${esc(String(e.message).slice(0, 40))}</span>`;
+    }
+  }
+}
+
+const refCache = new Map();
+
+function renderQuota(name, pl) {
+  const el = document.getElementById(`qmini-${name}`);
+  if (el) el.innerHTML = pl ? qminiHtmlFrom(pl) : '<span class="dim" style="font-size:11px">无额度数据</span>';
+}
+
+async function refreshQuotas(force = false, accounts = null) {
+  const list = accounts ?? window._accs ?? [];
+  const btn = document.getElementById("btnRefreshQuota");
+  if (force && btn) { btn.disabled = true; btn.innerHTML = '<span class="spin"></span>'; }
+  const now = Date.now();
+  for (const a of list) {
+    const c = quotaCache.get(a.name);
+    if (!force && c && now - c.at < QUOTA_CLIENT_TTL) { renderQuota(a.name, c.data); continue; }
+    try {
+      // ?refresh=1 仅在手动刷新时强制打上游；平时服务端有缓存直接回
+      const pl = await api(`/admin/accounts/${encodeURIComponent(a.name)}/plan${force ? "?refresh=1" : ""}`);
+      quotaCache.set(a.name, { at: Date.now(), data: pl });
+      renderQuota(a.name, pl);
+    } catch (e) {
+      if (force) renderQuota(a.name, null);
+      const el = document.getElementById(`qmini-${a.name}`);
+      if (!c && el) el.innerHTML = `<span class="dim" style="font-size:11px">额度获取失败：${esc(String(e.message).slice(0, 40))}</span>`;
+    }
+  }
+  persistQuotaCache();
+  if (force && btn) { btn.disabled = false; btn.textContent = "刷新额度"; toast("额度已刷新"); }
+  refreshReferrals(list, force);
+}
+
+// 页面打开期间每 5 分钟轻量刷新一次（命中服务端缓存，不打上游）
+setInterval(() => refreshQuotas(false), 5 * 60_000);
+
+/* ---- 操作 ---- */
+rowsEl.addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  const name = btn.dataset.name;
+  try {
+    if (btn.dataset.act === "copyref") {
+      const rf = refCache.get(name)?.data;
+      if (rf?.inviteLink) {
+        await navigator.clipboard.writeText(rf.inviteLink);
+        toast("📋 邀请链接已复制：" + rf.inviteLink);
+      }
+      return;
+    }
+    if (btn.dataset.act === "bindref") {
+      const others = (window._accs ?? []).map((a) => a.name === name ? null : refCache.get(a.name)?.data).filter((x) => x?.inviteCode);
+      const def = others[0]?.inviteCode ?? "";
+      const input = prompt(`给「${name}」绑定邀请码\n（可直接粘贴邀请码或邀请链接；留空则用池内默认：${def ? def + "（" + (others[0]?.inviteLink ?? "") + "）" : "无"}）`, def);
+      if (!input) return;
+      const code = input.trim().replace(/^.*\/r\//, "");
+      btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
+      const r = await api(`/admin/accounts/${encodeURIComponent(name)}/bind-referral`, { method: "POST", body: JSON.stringify({ code }) });
+      btn.disabled = false; btn.textContent = "接受邀请（绑定邀请码）";
+      if (r.ok) { toast(`✅ ${name} 已绑定邀请码 ${code}`); load(); return; }
+      if (r.captcha) {
+        toast(`已打开验证码助手页：无感验证通常自动通过，如弹滑块请拖一下`, false);
+        window.open(`/admin/bind-captcha.html?account=${encodeURIComponent(name)}&code=${encodeURIComponent(code)}`, "_blank");
+      } else {
+        toast(`❌ ${r.message}`, true);
+      }
+      return;
+    }
+    if (btn.dataset.act === "pause") {
+      const want = btn.dataset.paused !== "1";
+      await api(`/admin/accounts/${encodeURIComponent(name)}/pause`, { method: "PUT", body: JSON.stringify({ paused: want }) });
+      toast(want ? `⏸ 已暂停 ${name}（不再参与选号）` : `▶ 已恢复 ${name}`);
+      load();
+    } else if (btn.dataset.act === "del") {
+      if (!confirm(`删除账号「${name}」？`)) return;
+      await api(`/admin/accounts/${encodeURIComponent(name)}`, { method: "DELETE" });
+      toast("已删除"); load();
+    } else if (btn.dataset.act === "edit") {
+      const acc = (window._accs ?? []).find((a) => a.name === name);
+      location.href = `/admin/add-account.html?edit=${encodeURIComponent(name)}`;
+    } else if (btn.dataset.act === "plan") {
+      btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
+      const pl = await api(`/admin/accounts/${encodeURIComponent(name)}/plan`);
+      location.href = `/admin/quota.html?account=${encodeURIComponent(name)}`;
+    } else if (btn.dataset.act === "test") {
+      btn.disabled = true; btn.innerHTML = '<span class="spin"></span>';
+      const r = await api(`/admin/accounts/${encodeURIComponent(name)}/test`, { method: "POST" });
+      btn.disabled = false; btn.textContent = "测试";
+      if (r.ok) toast(`✅ ${name}: 上游 ${r.status}（${r.ms}ms）`);
+      else toast(`❌ ${name}: 上游 ${r.status} — ${r.snippet}`, true);
+      load();
+    }
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = "重试";
+    toast(e.message, true);
+  }
+});
+
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>

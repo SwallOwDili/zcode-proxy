@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>请求日志 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div class="toast" id="toast"></div>
+
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("requests", "请求日志", "最近的代理请求记录");
+
+const C = document.getElementById("pageContent");
+
+C.innerHTML = `
+  <section class="card">
+    <h2><span class="ico">📜</span>最近请求 <span class="dim mono" id="reqCount" style="font-weight:400;"></span>
+      <span class="tools">
+        <label class="muted" style="display:flex;align-items:center;gap:6px;font-size:12px;">
+          <input type="checkbox" id="onlyErr"> 只看失败
+        </label>
+        <button onclick="load()">刷新</button>
+      </span>
+    </h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:90px">时间</th><th style="width:120px">接口</th><th style="width:150px">模型</th><th style="width:100px">账号</th><th style="width:80px">状态</th><th>用量 / 耗时 / 备注</th></tr></thead>
+        <tbody id="reqRows"></tbody>
+      </table>
+    </div>
+    <div class="hint">日志保存在内存中，代理重启后清空。</div>
+  </section>`;
+
+const rowsEl = document.getElementById("reqRows");
+let all = [];
+
+let prices = {}; // /admin/pricing 缓存（模块级，render() 也要用）
+async function load() {
+  try {
+    const reqs = await api("/admin/recent");
+    prices = await getPrices();
+    all = reqs.recent ?? [];
+    render();
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function render() {
+  const onlyErr = document.getElementById("onlyErr").checked;
+  const list = onlyErr ? all.filter((r) => r.status >= 400) : all;
+  rowsEl.innerHTML = list.map((r) => `
+    <tr>
+      <td class="mono dim">${esc(r.at)}</td>
+      <td class="mono">${esc(r.kind)}</td>
+      <td class="mono">${esc(r.model)}</td>
+      <td class="mono priv">${esc(r.account ?? "-")}</td>
+      <td>${r.status >= 500 ? badge("b-red", r.status) : r.status >= 400 ? badge("b-yellow", r.status) : badge("b-green", r.status)}</td>
+      <td class="mono muted" style="font-size:12px">${r.in || r.out ? `in ${r.in ?? 0} · out ${r.out ?? 0} · cache ${r.cache ?? 0} · ${r.ttft ? `首${(r.ttft / 1000).toFixed(1)}s ` : ""}全${((r.ms ?? 0) / 1000).toFixed(1)}s${rowCost(prices, r.model, r)}` : ""}${r.note ? " · " + esc(String(r.note).slice(0, 80)) : ""}</td>
+    </tr>`).join("") || `<tr><td colspan="6" class="dim" style="text-align:center">${onlyErr ? "没有失败请求 🎉" : "暂无请求"}</td></tr>`;
+  document.getElementById("reqCount").textContent = `${list.length} 条${onlyErr ? "（仅失败）" : ""}`;
+}
+
+document.getElementById("onlyErr").addEventListener("change", render);
+load();
+setInterval(load, 3000);
+</script>
+</body>
+</html>

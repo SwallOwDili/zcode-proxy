@@ -1,0 +1,12 @@
+services:
+  zcode-proxy:
+    image: ghcr.io/swallowdili/zcode-proxy:latest   # GitHub Actions 构建推送；本地构建用: build: .
+    container_name: zcode-proxy
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./state:/data/state
+    environment:
+      - ZPROXY_TOKEN=${ZPROXY_TOKEN:-}
+      - ZPROXY_DEFAULT_MODEL=${ZPROXY_DEFAULT_MODEL:-GLM-5.3-Flash}
+    restart: unless-stopped

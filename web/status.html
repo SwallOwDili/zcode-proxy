@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>服务状态 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div class="toast" id="toast"></div>
+
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("status", "服务状态", "代理运行状况与端点自检");
+
+const C = document.getElementById("pageContent");
+
+C.innerHTML = `
+  <section class="card">
+    <h2><span class="ico">🩺</span>运行状态
+      <span class="tools"><button onclick="load()">刷新</button></span>
+    </h2>
+    <dl class="kv" id="kv"></dl>
+  </section>
+
+  <section class="card">
+    <h2><span class="ico">🔌</span>端点自检<span class="dim" style="font-weight:400;font-size:12px;">逐个探测代理对外接口</span></h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:200px">端点</th><th style="width:90px">状态</th><th style="width:90px">耗时</th><th>说明</th></tr></thead>
+        <tbody id="epRows"></tbody>
+      </table>
+    </div>
+  </section>`;
+
+async function load() {
+  try {
+    const h = await api("/admin/summary");
+    const t = h.tps ?? { total: 0, perAccount: {}, idle: true };
+    document.getElementById("kv").innerHTML = `
+      <dt>服务状态</dt><dd>${h.ok ? "正常" : "异常"}</dd>
+      <dt>监听地址</dt><dd>${esc(h.listen ?? "-")}</dd>
+      <dt>账号总数</dt><dd>${esc(h.accounts)}（健康 ${esc(h.healthyNow)}）</dd>
+      <dt>账号来源</dt><dd>${h.accountSource === "tokens" ? "tokens.json（可编辑）" : "ZCode 本地登录"}</dd>
+      <dt>System 提示词块</dt><dd>${esc(h.systemPromptBlocks)}（注入必需）</dd>
+      <dt>默认模型</dt><dd>${esc(h.defaultModel)}</dd>
+      <dt>全局 TPS</dt><dd>${t.total > 0 ? `${t.total} tok/s（活跃 ${t.activeSec}s）` : "空闲"}</dd>
+      <dt>各账号 TPS</dt><dd>${Object.entries(t.perAccount ?? {}).map(([k, v]) => `${esc(k)}=${v}`).join("  ") || "-"}</dd>
+      <dt>模型映射</dt><dd>${Object.entries(h.modelMap ?? {}).map(([k, v]) => `${esc(k)} → ${esc(v)}`).join("  ") || "-"}</dd>`;
+  } catch (e) {
+    toast(e.message, true);
+  }
+  probe();
+}
+
+async function probe() {
+  const eps = [
+    { name: "GET /health", path: "/health", method: "GET" },
+    { name: "GET /v1/models", path: "/v1/models", method: "GET" },
+    { name: "GET /admin/summary", path: "/admin/summary", method: "GET" },
+    { name: "GET /admin/accounts", path: "/admin/accounts", method: "GET" },
+    { name: "GET /admin/claim/status", path: "/admin/claim/status", method: "GET" },
+    { name: "GET /admin/usage?days=1", path: "/admin/usage?days=1", method: "GET" },
+    { name: "GET /admin/modelmap", path: "/admin/modelmap", method: "GET" },
+    { name: "GET /admin/pricing", path: "/admin/pricing", method: "GET" },
+  ];
+  const tb = document.getElementById("epRows");
+  tb.innerHTML = "";
+  for (const ep of eps) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="mono">${esc(ep.name)}</td><td><span class="spin"></span></td><td class="mono dim">–</td><td class="dim">检测中…</td>`;
+    tb.appendChild(tr);
+    const t0 = performance.now();
+    try {
+      const res = await fetch(ep.path, { headers: TOKEN ? { authorization: `Bearer ${TOKEN}` } : {} });
+      const ms = Math.round(performance.now() - t0);
+      const ok = res.ok;
+      let note = "";
+      try {
+        const d = await res.clone().json();
+        if (d && typeof d === "object") {
+          note = Object.keys(d).slice(0, 4).join(", ");
+          if (d.models) note = (Array.isArray(d.models) ? d.models.map((m) => m.id).join(", ") : JSON.stringify(d.models)).slice(0, 90);
+        }
+      } catch {}
+      tr.innerHTML = `<td class="mono">${esc(ep.name)}</td>
+        <td>${ok ? badge("b-green", res.status) : badge("b-red", res.status)}</td>
+        <td class="mono dim">${ms}ms</td>
+        <td class="dim" style="font-size:12px">${esc(note)}</td>`;
+    } catch (e) {
+      const ms = Math.round(performance.now() - t0);
+      tr.innerHTML = `<td class="mono">${esc(ep.name)}</td>
+        <td>${badge("b-red", "失败")}</td>
+        <td class="mono dim">${ms}ms</td>
+        <td class="dim" style="font-size:12px">${esc(String(e.message).slice(0, 80))}</td>`;
+    }
+  }
+}
+
+load();
+setInterval(load, 8000);
+</script>
+</body>
+</html>

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>接受邀请 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+<style>
+  .bind-card { max-width: 520px; margin: 40px auto; padding: 24px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); }
+  .bind-step { margin: 10px 0; font-size: 14px; color: var(--fg, inherit); }
+  .bind-ok { color: #16a34a; font-weight: 600; }
+  .bind-err { color: #dc2626; font-weight: 600; }
+  #captcha-element { margin: 12px 0; }
+  iframe { border: 0; width: 300px; height: 0; }
+</style>
+</head>
+<body>
+<div class="toast" id="toast"></div>
+<script src="/admin/assets/app.js"></script>
+<div class="bind-card">
+  <h2>🤝 接受邀请绑定</h2>
+  <div class="bind-step">账号：<b id="accName">–</b>　邀请码：<b class="mono" id="refCode">–</b></div>
+  <div class="bind-step" id="step1">① 正在加载阿里云无感验证…（若弹出滑块/空格验证，请手动完成）</div>
+  <div id="captcha-element"></div>
+  <button id="captcha-button" style="display:none">触发验证</button>
+  <div class="bind-step" id="bindResult"></div>
+  <div class="bind-step dim" style="font-size:12px">验证参数由本页浏览器环境生成（与官网同一 SDK），拿到后立即由代理服务端携带账号凭据完成绑定，参数单次有效。</div>
+</div>
+<script>
+const qs = new URLSearchParams(location.search);
+const account = qs.get("account") ?? "";
+const code = (qs.get("code") ?? "").trim().replace(/^.*\/(r|invite)\//, "");
+document.getElementById("accName").textContent = account || "(未指定)";
+document.getElementById("refCode").textContent = code || "(未指定)";
+function toast(msg, isErr) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.style.display = "block";
+  t.style.background = isErr ? "#7f1d1d" : "#14532d";
+  setTimeout(() => { t.style.display = "none"; }, 6000);
+}
+window.AliyunCaptchaConfig = { region: "cn", prefix: "no8xfe" };
+let bindDone = false;
+async function doBind(captchaVerifyParam) {
+  if (bindDone) return;
+  bindDone = true;
+  document.getElementById("step1").innerHTML = "② 验证通过，正在提交绑定…";
+  try {
+    const r = await fetch(`/admin/accounts/${encodeURIComponent(account)}/bind-referral`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ invite_code: code, captchaVerifyParam }),
+    });
+    const j = await r.json();
+    const el = document.getElementById("bindResult");
+    if (j.ok) { el.innerHTML = `<span class="bind-ok">✅ 绑定成功！${account} 已接受 ${code} 的邀请。接下来在新账号里完成「登录客户端 + 发送一条消息」即可拿满新手奖励。</span>`; toast("绑定成功"); }
+    else { el.innerHTML = `<span class="bind-err">❌ 绑定失败：${j.message ?? JSON.stringify(j)}</span>`; bindDone = false; }
+  } catch (e) {
+    document.getElementById("bindResult").innerHTML = `<span class="bind-err">❌ 请求异常：${e.message}</span>`;
+    bindDone = false;
+  }
+}
+window.bindCode = code;
+(async () => {
+  window.AliyunCaptchaConfig = { region: "cn", prefix: "no8xfe" };
+  await new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
+    s.async = true;
+    s.onload = resolve; s.onerror = () => reject(new Error("验证码 SDK 加载失败"));
+    document.head.appendChild(s);
+  });
+  window.initAliyunCaptcha({
+    SceneId: "11xygtvd",
+    mode: "popup",
+    language: "cn",
+    element: "#captcha-element",
+    button: "#captcha-button",
+    getInstance: (instance) => {
+      try { document.getElementById("captcha-button").click(); } catch {}
+    },
+    captchaVerifyCallback: async (captchaVerifyParam) => {
+      await doBind(captchaVerifyParam);
+      return { captchaResult: true, bizResult: true };
+    },
+    onBizResultCallback: () => {},
+  });
+})().catch((e) => {
+  document.getElementById("bindResult").innerHTML = `<span class="bind-err">❌ ${e.message}</span>`;
+});
+</script>
+</body>
+</html>

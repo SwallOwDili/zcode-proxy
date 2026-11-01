@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>仪表盘 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div class="toast" id="toast"></div>
+
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("index", "仪表盘", "服务运行概览");
+
+const C = document.getElementById("pageContent");
+
+const fmtU = (n) => {
+  if (n == null) return "0";
+  if (n >= 0.1e12) return (n / 1e12).toFixed(2) + "T";
+  if (n >= 0.1e9) return (n / 1e9).toFixed(2) + "B";
+  if (n >= 0.1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 0.1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n ?? 0);
+};
+// 缓存命中率 = cache / (in + cache)
+const cacheRate = (input, cache) => {
+  const t = (input ?? 0) + (cache ?? 0);
+  return t > 0 ? (((cache ?? 0) / t) * 100).toFixed(1) : "0.0";
+};
+
+function renderHourlyChart(hours) {
+  const el = document.getElementById("hourlyChart");
+  if (!el) return;
+  const W = 960, Hh = 200, P = 34;
+  const maxV = Math.max(1, ...hours.map(h => Math.max(h.in, h.out)));
+  const bw = (W - P * 2) / 24;
+  const x = (i) => P + i * bw;
+  const y = (v) => Hh / 2 - (v / maxV) * (Hh / 2 - P);
+  const bars = hours.map((h, i) => {
+    const w = Math.max(3, bw - 6);
+    const up = h.in > 0 ? `<rect x="${x(i) + 3}" y="${y(h.in)}" width="${w}" height="${Hh / 2 - y(h.in)}" rx="2" fill="#3b82f6" opacity=".85"/>` : "";
+    const down = h.out > 0 ? `<rect x="${x(i) + 3}" y="${Hh / 2}" width="${w}" height="${(h.out / maxV) * (Hh / 2 - P)}" rx="2" fill="#f59e0b" opacity=".85"/>` : "";
+    return up + down;
+  }).join("");
+  const midline = `<line x1="${P}" y1="${Hh / 2}" x2="${W - P}" y2="${Hh / 2}" stroke="rgba(128,128,128,.3)" stroke-width="1"/>`;
+  const labels = hours.map((h, i) => i % 2 === 0
+    ? `<text x="${x(i) + bw / 2}" y="${Hh - 6}" text-anchor="middle" font-size="10" fill="#8b95a5">${String(h.hour).padStart(2, "0")}</text>` : "").join("");
+  const nowH = hours[new Date().getHours()] ?? {};
+  const tip = `<text x="${P}" y="${P - 10}" font-size="11" fill="#3b82f6">▲ in ${fmtU(nowH.in ?? 0)}</text>
+    <text x="${P + 90}" y="${P - 10}" font-size="11" fill="#f59e0b">▼ out ${fmtU(nowH.out ?? 0)}</text>
+    <text x="${W - P}" y="${P - 10}" text-anchor="end" font-size="11" fill="#8b95a5">峰值 ${fmtU(maxV)}</text>`;
+  el.innerHTML = `<svg viewBox="0 0 ${W} ${Hh}" style="width:100%;height:auto">
+    ${midline}${bars}${labels}${tip}
+  </svg>
+  <div class="dim" style="font-size:11px;margin-top:2px">上柱=输入 tokens · 下柱=输出 tokens · 横轴小时（北京时间）</div>`;
+}
+
+
+async function toggleRouting() {
+  try {
+    const cur = (await api("/admin/routing")).mode;
+    const next = cur === "tps" ? "cache" : "tps";
+    await api("/admin/routing", { method: "PUT", body: JSON.stringify({ mode: next }) });
+    toast(next === "tps" ? "已切换：TPS 优先（负载最小，不看会话亲和）" : "已切换：缓存优先（会话亲和优先）");
+    load();
+  } catch (e) { toast(e.message, true); }
+}
+
+let prices = {}; // /admin/pricing 缓存（模块级，render() 也要用）
+async function load() {
+  try {
+    const h = await api("/admin/summary");
+    const [d, pool] = await Promise.all([
+      api("/admin/dashboard").catch(() => null),
+      api("/admin/pool-balance").catch(() => null),
+    ]);
+    const t = h.tps ?? { total: 0, perAccount: {}, idle: true };
+    const tpsHtml = t.total > 0
+      ? `<span style="color:var(--green)">${t.total}</span><small>tok/s · 活跃 ${t.activeSec}s</small>`
+      : `<small>空闲</small>`;
+
+    // 按模型卡片（当日 tokens）
+    const models = Object.entries(d.byModel ?? {}).sort((a, b) => b[1].total - a[1].total);
+    const modelCards = models.map(([m, v]) => `
+      <div class="stat"><div class="label">${esc(m)}<small style="margin-left:6px">${v.req} 次请求</small></div>
+        <div class="value">${fmtU(v.total)}<small style="display:block;margin-top:2px">输入 ${fmtU(v.in)} · 输出 ${fmtU(v.out)}${v.cache ? ` · 缓存命中 ${fmtU(v.cache)}<b style="color:var(--green);margin-left:4px">${cacheRate(v.in, v.cache)}%</b>` : ""}</small></div></div>`).join("")
+      || '<div class="stat"><div class="label">当日</div><div class="value txt">暂无请求</div></div>';
+    const T = d.total ?? {};
+    // 小时柱状图（比折线更适合稀疏数据）+ in/out 双系列
+    const hours = d.hourly ?? [];
+
+    const tpsVal = tpsHtml.includes("空闲") ? "空闲" : (tpsHtml.match(/^[\d.]+/)?.[0] ?? "?") + " tok/s";
+    const poolModels = Object.entries(pool?.byModel ?? {});
+    const poolCards = poolModels.map(([m, v]) => `
+      <div class="stat"><div class="label">全池可用 · ${esc(m)}<small>9 个账号汇总</small></div>
+        <div class="value" style="color:var(--green)">${fmtU(v.remaining)}<small style="display:block;margin-top:2px">总容量 ${fmtU(v.total)}</small></div></div>`).join("");
+
+    C.innerHTML = `
+      <section class="stats">
+        ${poolCards}
+        <div class="stat"><div class="label">实时消耗速率<small>输出 TPS</small></div>
+          <div class="value" id="rtRate" style="color:var(--muted)">0<small style="display:block;margin-top:2px">tok/s 输出</small></div></div>
+        <div class="stat"><div class="label">当日 tokens 总量<small>缓存命中 ${fmtU(T.cache)} · 命中率 ${cacheRate(T.in, T.cache)}%</small></div>
+          <div class="value">${fmtU(T.tokens)}<small style="display:block;margin-top:2px">输入 ${fmtU(T.in)} · 输出 ${fmtU(T.out)}</small></div></div>
+        <div class="stat"><div class="label">当日请求数<small>路由 ${h.routingMode === "tps" ? "TPS 优先" : "缓存优先"} · 亲和 ${h.affinitySessions ?? 0}</small></div>
+          <div class="value">${T.req ?? 0}<small style="display:block;margin-top:2px">健康 ${h.healthyNow ?? 0}</small></div></div>
+        <div class="stat-removed"></div>
+          <div class="value">${T.req ?? 0}<small style="display:block;margin-top:2px">路由 ${h.routingMode === "tps" ? "TPS 优先" : "缓存优先"} · 亲和 ${h.affinitySessions ?? 0}</small></div></div>
+        <div class="stat"><div class="label">默认模型</div><div class="value txt mono">${esc(h.defaultModel)}</div></div>
+      </section>
+
+      <section class="card">
+        <h2><span class="ico">📊</span>当日 tokens 分模型</h2>
+        <div class="stats" style="margin-top:4px">${modelCards}</div>
+      </section>
+
+      <section class="card">
+        <h2><span class="ico">📈</span>24 小时请求分布<span class="tools dim" style="font-weight:400;font-size:12px">上柱 in（蓝）/ 下柱 out（橙）· 北京时间</span></h2>
+        <div id="hourlyChart" style="margin-top:8px"></div>
+      </section>
+
+      <section class="card">
+        <h2><span class="ico">🧭</span>快捷入口</h2>
+        <div class="row">
+          <a class="nav-item" style="background:var(--panel2);border:1px solid var(--border);padding:9px 14px;border-radius:9px" href="/admin/accounts.html">👥 账号列表</a>
+          <a class="nav-item" style="background:var(--panel2);border:1px solid var(--border);padding:9px 14px;border-radius:9px" href="/admin/add-account.html">➕ 添加 / 登录</a>
+          <a class="nav-item" style="background:var(--panel2);border:1px solid var(--border);padding:9px 14px;border-radius:9px" href="/admin/usage.html">📈 用量统计</a>
+          <a class="nav-item" style="background:var(--panel2);border:1px solid var(--border);padding:9px 14px;border-radius:9px" href="/admin/models.html">🔀 模型映射</a>
+          <a class="nav-item" style="background:var(--panel2);border:1px solid var(--border);padding:9px 14px;border-radius:9px" href="/admin/playground.html">💬 模拟对话</a>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2><span class="ico">🔀</span>模型映射<span class="dim" style="font-weight:400;font-size:12px;">别名 → 上游模型</span></h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>别名</th><th style="width:220px">上游模型</th></tr></thead>
+            <tbody id="mapRows"></tbody>
+          </table>
+        </div>
+        <div class="hint">完整编辑见「配置 → 模型映射」。</div>
+      </section>
+
+      <section class="card">
+        <h2><span class="ico">📜</span>最近请求 <span class="dim mono" id="reqCount" style="font-weight:400;"></span>
+          <span class="tools"><a href="/admin/requests.html" style="font-size:12px;color:var(--accent);text-decoration:none">查看全部 →</a></span>
+        </h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th style="width:80px">时间</th><th style="width:120px">接口</th><th style="width:150px">模型</th><th style="width:90px">账号</th><th style="width:80px">状态</th><th>用量 / 耗时</th></tr></thead>
+            <tbody id="reqRows"></tbody>
+          </table>
+        </div>
+      </section>`;
+
+    if (typeof d !== "undefined" && d) renderHourlyChart(d.hourly ?? []);
+
+    if (!window.__livePoll) {
+      // 实时速率：1s 轮询 /admin/rate（服务器端 60s 滑动窗口，免长连接）
+      window.__livePoll = setInterval(async () => {
+        try {
+          const r = await fetch("/admin/rate");
+          if (!r.ok) return;
+          const msg = await r.json();
+          window.__liveRateCache = msg;
+          updateRateCard(msg);
+        } catch {}
+      }, 1000);
+    }
+    function updateRateCard(rt) {
+      const el = document.getElementById("rtRate");
+      if (!el) return;
+      const active = rt.active === true;
+      el.style.color = active ? "var(--green)" : "var(--muted)";
+      // 大字 = 消耗速率（输入+输出 总和），始终显示真实值（随 60s 窗口自然衰减）；
+      // active 只控制颜色——原版归零逻辑与副行口径不一致（副行有数大字 0）
+      el.childNodes[0].textContent = rt.outPerSec ?? 0;
+      const sm = el.querySelector("small");
+      if (sm) sm.textContent = `tok/s 输出`;
+    }
+    function liveRateFromEvents() {
+      // 从最近推送的 req 事件计算速率（简化：客户端自己累计）
+      if (!window.__liveEvents) window.__liveEvents = [];
+      return window.__liveRateCache ?? { active: false, outPerSec: 0, inPerSec: 0 };
+    }
+
+    const mapRows = document.getElementById("mapRows");
+    mapRows.innerHTML = Object.entries(h.modelMap ?? {})
+      .map(([k, v]) => `<tr><td class="mono">${esc(k)}</td><td class="mono">${esc(v)}</td></tr>`).join("")
+      || `<tr><td colspan="2" class="dim">暂无映射</td></tr>`;
+
+    const reqs = await api("/admin/recent");
+    prices = await getPrices();
+    document.getElementById("reqRows").innerHTML = reqs.recent.slice(0, 12).map((r) => `
+      <tr>
+        <td class="mono dim">${esc(r.at)}</td>
+        <td class="mono">${esc(r.kind)}</td>
+        <td class="mono">${esc(r.model)}</td>
+        <td class="mono priv">${esc(r.account ?? "-")}</td>
+        <td>${r.status >= 500 ? badge("b-red", r.status) : r.status >= 400 ? badge("b-yellow", r.status) : badge("b-green", r.status)}</td>
+        <td class="mono muted" style="font-size:12px">${r.in || r.out ? `in ${r.in ?? 0} · out ${r.out ?? 0} · cache ${r.cache ?? 0} · ${r.ttft ? `首${(r.ttft / 1000).toFixed(1)}s ` : ""}全${((r.ms ?? 0) / 1000).toFixed(1)}s${rowCost(prices, r.model, r)}` : ""}${r.note ? " · " + esc(String(r.note).slice(0, 60)) : ""}</td>
+      </tr>`).join("") || `<tr><td colspan="6" class="dim">暂无请求</td></tr>`;
+    document.getElementById("reqCount").textContent = `${reqs.recent.length} 条`;
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>

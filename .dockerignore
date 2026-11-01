@@ -1,0 +1,10 @@
+build/
+state/
+.zcode/
+archive/
+.git/
+Testing/
+*.md
+restart.sh
+scripts/
+tools/

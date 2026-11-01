@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>每日领取 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div class="toast" id="toast"></div>
+
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("claim", "每日领取", "按账号自动领取每日套餐");
+
+const C = document.getElementById("pageContent");
+let claimPoll = null;
+let detailOpen = localStorage.getItem("claimDetailOpen") === "1";
+
+C.innerHTML = `
+  <section class="card">
+    <h2><span class="ico">🎁</span>领取状态
+      <span class="tools">
+        <button class="primary" onclick="claimRun()">立即领取一轮</button>
+        <button onclick="refresh()">刷新</button>
+      </span>
+    </h2>
+    <div id="claimStatus" class="hint">加载中…</div>
+    <div class="hint">领取是按账号逐个进行的：单个账号通常 1 分钟内完成。已领取过的账号会显示「已在列」，不会重复消耗。</div>
+  </section>
+
+  <section class="card">
+    <h2><span class="ico">📋</span>明细</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="width:200px">账号</th><th style="width:120px">状态</th><th>详情</th></tr></thead>
+        <tbody id="claimRows"></tbody>
+      </table>
+    </div>
+  </section>`;
+
+async function refresh() {
+  try {
+    const s = await api("/admin/claim/status");
+    const per = Object.entries(s.perAccount ?? {});
+    const ok = per.filter(([, x]) => x.status === "claimed").length;
+    const alr = per.filter(([, x]) => x.status === "already").length;
+    const fail = per.filter(([, x]) => x.status === "failed").length;
+    const live = (s.live ?? []).map((r) => {
+      const icon = r.status === "claimed" ? "✅" : r.status === "already" ? "✔️" : r.status === "pending" ? "⏳" : "❌";
+      return `${icon} ${r.account}: ${r.status === "pending" ? "领取中…" : r.status} ${r.detail ? `（${r.detail}）` : ""}`;
+    });
+    const head = s.running
+      ? `⏳ 正在领取（${live.length} 个已完成）…`
+      : `今日（${esc(s.dayTag ?? "-")}）：成功 ${ok} · 已有 ${alr} · 失败 ${fail}${s.lastRun ? ` · 上次运行 ${new Date(s.lastRun.at).toLocaleTimeString()}` : ""}`;
+
+    const showDetail = live.length && (s.running || detailOpen);
+    const arrow = detailOpen ? "▾" : "▸";
+    document.getElementById("claimStatus").innerHTML =
+      `<span style="cursor:pointer;user-select:none" onclick="toggleDetail()"><b>${head}</b> ${live.length ? `<span style="color:var(--muted)">${arrow}</span>` : ""}</span>` +
+      (showDetail ? `<br>${live.join("<br>")}` : "");
+
+    const rows = per.length
+      ? per.map(([name, x]) => {
+          const st = x.status === "claimed" ? badge("b-green", "claimed")
+            : x.status === "already" ? badge("b-blue", "already")
+            : x.status === "failed" ? badge("b-red", "failed")
+            : badge("b-gray", x.status);
+          return `<tr><td class="mono">${esc(name)}</td><td>${st}</td><td class="muted">${esc(x.detail ?? "-")}</td></tr>`;
+        }).join("")
+      : `<tr><td colspan="3" class="dim">暂无领取记录</td></tr>`;
+    document.getElementById("claimRows").innerHTML = rows;
+
+    if (s.running && !claimPoll) claimPoll = setInterval(refresh, 2000);
+    if (!s.running && claimPoll) { clearInterval(claimPoll); claimPoll = null; }
+  } catch {
+    document.getElementById("claimStatus").textContent = "状态读取失败，稍后重试…";
+  }
+}
+
+function toggleDetail() {
+  detailOpen = !detailOpen;
+  localStorage.setItem("claimDetailOpen", detailOpen ? "1" : "0");
+  refresh();
+}
+
+async function claimRun() {
+  try {
+    await api("/admin/claim/run", { method: "POST", body: JSON.stringify({ force: true }) });
+    toast("领取周期已启动（每账号最多约 1 分钟，稍后查看状态）");
+    refresh();
+  } catch (e) { toast(e.message, true); }
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

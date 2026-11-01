@@ -1,0 +1,8 @@
+build/
+state/
+state/logs/
+*.json.tmp
+.zcode/
+.DS_Store
+Testing/
+archive/

@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>价目设置 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div class="toast" id="toast"></div>
+
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("pricing", "价目设置", "按模型覆盖官方 token 单价（元 / 百万 tokens）");
+
+const C = document.getElementById("pageContent");
+let priceDraft = null;
+
+C.innerHTML = `
+  <section class="card">
+    <h2><span class="ico">💰</span>价目表
+      <span class="tools">
+        <button onclick="addPriceRow()">＋ 模型</button>
+        <button class="primary" onclick="savePricing()">保存价目</button>
+      </span>
+    </h2>
+    <div class="dim" style="font-size:12px;margin-bottom:10px;">
+      单位：元 / 百万 tokens。留空或删掉某模型即回落到内置默认价。
+    </div>
+    <div id="priceRows"></div>
+    <div class="hint">
+      保存写入 pricing.json 并立即生效，用量统计页的金额列会按这里的单价计算。
+    </div>
+  </section>
+
+  <section class="card">
+    <h2><span class="ico">ℹ️</span>说明</h2>
+    <div class="hint" style="margin-top:0;">
+      内置默认价（元 / 百万 tokens）：GLM-5.3-Flash 输入 ¥0.8 / 输出 ¥2.8；GLM-5.3 输入 ¥8 / 输出 ¥28；GLM-5.3-FlashX 输入 ¥2 / 输出 ¥7。<br>
+      若上游实际计费不同，在这里覆盖即可。删除某行即回落到内置默认价。
+    </div>
+  </section>`;
+
+async function load() {
+  try {
+    const r = await api("/admin/pricing");
+    priceDraft = { ...r.prices };
+    renderPriceRows();
+  } catch (e) { toast(e.message, true); }
+}
+
+function renderPriceRows() {
+  const tb = document.getElementById("priceRows");
+  tb.innerHTML = Object.entries(priceDraft).map(([k, v]) =>
+    `<div style="display:flex;gap:8px;margin-bottom:6px;align-items:center;">
+      <input class="mono" data-pk="${esc(k)}" value="${esc(k)}" style="flex:1" placeholder="模型名">
+      <span class="dim" style="font-size:11px">输入</span>
+      <input class="mono" data-pin="${esc(k)}" type="number" step="0.01" min="0" value="${v.in}" style="width:110px">
+      <span class="dim" style="font-size:11px">输出</span>
+      <input class="mono" data-pout="${esc(k)}" type="number" step="0.01" min="0" value="${v.out}" style="width:110px">
+      <button class="danger" onclick="delPriceRow('${esc(k)}')">删</button>
+    </div>`).join("") || `<div class="empty">暂无自定义价目，使用内置默认价</div>`;
+}
+
+function addPriceRow() {
+  const name = prompt("模型名（如 GLM-5.3）");
+  if (!name) return;
+  if (priceDraft[name]) return toast("该模型已存在");
+  priceDraft[name] = { in: 0, out: 0 };
+  renderPriceRows();
+}
+
+function delPriceRow(k) { delete priceDraft[k]; renderPriceRows(); }
+
+async function savePricing() {
+  const out = {};
+  document.querySelectorAll("#priceRows [data-pk]").forEach((inp) => {
+    const k = inp.value.trim();
+    const i = parseFloat(document.querySelector(`#priceRows [data-pin="${CSS.escape(inp.dataset.pk)}"]`)?.value ?? "0");
+    const o = parseFloat(document.querySelector(`#priceRows [data-pout="${CSS.escape(inp.dataset.pk)}"]`)?.value ?? "0");
+    if (k && Number.isFinite(i) && Number.isFinite(o)) out[k] = { in: i, out: o };
+  });
+  try {
+    await api("/admin/pricing", { method: "PUT", body: JSON.stringify({ prices: out }) });
+    toast("价目已保存，立即生效");
+    load();
+  } catch (e) { toast(e.message, true); }
+}
+
+load();
+</script>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>用量统计 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div class="toast" id="toast"></div>
+
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("usage", "用量统计", "按 账号 × 模型 计量 token 消耗");
+
+const C = document.getElementById("pageContent");
+
+C.innerHTML = `
+  <section class="card">
+    <h2><span class="ico">📈</span>用量明细
+      <span class="tools">
+        <select id="usageDay" style="width:auto;padding:4px 8px;"></select>
+        <a href="/admin/pricing.html"><button>💰 价目设置</button></a>
+      </span>
+    </h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>账号</th><th>模型</th><th style="width:80px">请求数</th><th style="width:120px">输入 tokens</th><th style="width:120px">输出 tokens</th><th style="width:120px">合计 tokens</th><th style="width:120px">缓存命中</th><th style="width:110px">金额(¥)</th></tr></thead>
+        <tbody id="usageRows"></tbody>
+        <tfoot><tr id="usageTotal" style="font-weight:700"></tr></tfoot>
+      </table>
+    </div>
+    <div class="hint">
+      统计口径：OpenAI 协议 <span class="mono">/v1/chat/completions</span> 的成功请求（流式按 SSE usage 汇总）；Anthropic 透传暂不计入。
+      金额按 bigmodel 官方价（元 / 百万 tokens，可在「价目设置」覆盖）；usage.json 保留 30 天。
+    </div>
+  </section>`;
+
+async function loadUsage() {
+  try {
+    const meta = await api("/admin/usage?days=14");
+    const sel = document.getElementById("usageDay");
+    const cur = sel.value;
+    sel.innerHTML = meta.days.slice().reverse().map((d) => `<option value="${d}">${d}</option>`).join("") || "<option>暂无数据</option>";
+    if (meta.days.includes(cur)) sel.value = cur;
+
+    const rows = Object.entries(meta.data[sel.value] ?? {});
+    const prices = meta.prices ?? {};
+    let tReq = 0, tIn = 0, tOut = 0, tCost = 0, hasCost = true;
+
+    document.getElementById("usageRows").innerHTML = rows.map(([key, v]) => {
+      const [account, model] = key.split("");
+      tReq += v.req; tIn += v.in; tOut += v.out;
+      const c = costOf(prices, model, v.in, v.out);
+      if (c === "—") hasCost = false; else tCost += parseFloat(c) || 0;
+      return `<tr>
+        <td class="mono priv">${esc(account)}</td>
+        <td class="mono">${esc(model)}</td>
+        <td>${v.req}</td>
+        <td>${fmtUnits(v.in)}</td>
+        <td>${fmtUnits(v.out)}</td>
+        <td>${fmtUnits(v.in + v.out)}</td>
+        <td>${v.cache ? fmtUnits(v.cache) : "—"}</td>
+        <td class="mono">${c === "—" ? "—" : "¥" + c}</td>
+      </tr>`;
+    }).join("") || `<tr><td colspan="8" class="dim" style="text-align:center">该日暂无请求</td></tr>`;
+
+    document.getElementById("usageTotal").innerHTML =
+      `<td>合计</td><td></td><td>${tReq}</td><td>${fmtUnits(tIn)}</td><td>${fmtUnits(tOut)}</td><td>${fmtUnits(tIn + tOut)}</td><td class="mono">${hasCost ? "¥" + tCost.toFixed(4).replace(/\.?0+$/, "") : "—"}</td>`;
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+document.getElementById("usageDay").addEventListener("change", loadUsage);
+loadUsage();
+setInterval(loadUsage, 10000);
+</script>
+</body>
+</html>

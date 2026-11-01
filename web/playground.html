@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模拟对话 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div class="toast" id="toast"></div>
+
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("playground", "模拟对话", "走完整代理链路验证上游");
+
+const C = document.getElementById("pageContent");
+
+C.innerHTML = `
+  <section class="card">
+    <h2><span class="ico">💬</span>客户端对话</h2>
+    <div class="row">
+      <select id="pgModel" style="width:240px;"></select>
+      <label class="muted" style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="pgStream" checked> 流式</label>
+      <button class="primary" id="pgSend" onclick="pgSend()">发送</button>
+    </div>
+    <textarea id="pgInput" rows="4" style="margin-top:10px;" placeholder="输入消息，作为 user 消息发送（OpenAI 协议 /v1/chat/completions）"></textarea>
+    <div class="pg-out mono" id="pgOut"></div>
+    <div class="hint" id="pgUsage"></div>
+  </section>`;
+
+async function loadModels() {
+  try {
+    const h = await api("/admin/summary");
+    const names = [...new Set([h.defaultModel, ...Object.keys(h.modelMap ?? {}), "GLM-5.3", "GLM-5.3-Flash"])];
+    const sel = document.getElementById("pgModel");
+    sel.innerHTML = names.map((m) => `<option>${esc(m)}</option>`).join("");
+    sel.value = h.defaultModel;
+  } catch (e) { toast(e.message, true); }
+}
+
+async function pgSend() {
+  const text = document.getElementById("pgInput").value.trim();
+  if (!text) return toast("先输入消息", true);
+  const model = document.getElementById("pgModel").value;
+  const stream = document.getElementById("pgStream").checked;
+  const out = document.getElementById("pgOut");
+  const usageEl = document.getElementById("pgUsage");
+  document.getElementById("pgSend").disabled = true;
+  out.innerHTML = ""; usageEl.textContent = "请求中…";
+  let reasoning = "", content = "", usage = null, finish = "";
+
+  const render = () => {
+    out.innerHTML = (reasoning ? `<div class="reasoning">${esc(reasoning)}</div>` : "") + `<div>${esc(content)}</div>`;
+    out.scrollTop = out.scrollHeight;
+  };
+
+  try {
+    const res = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model, stream, messages: [{ role: "user", content: text }] }),
+    });
+    if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error?.message ?? `HTTP ${res.status}`); }
+
+    if (!stream) {
+      const d = await res.json();
+      content = d.choices?.[0]?.message?.content ?? "";
+      reasoning = d.choices?.[0]?.message?.reasoning_content ?? "";
+      usage = d.usage; finish = d.choices?.[0]?.finish_reason;
+    } else {
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n\n")) >= 0) {
+          const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+          for (const line of raw.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (payload === "[DONE]") continue;
+            let d; try { d = JSON.parse(payload); } catch { continue; }
+            if (d.usage) usage = d.usage;
+            const ch = d.choices?.[0];
+            if (ch?.delta?.reasoning_content) reasoning += ch.delta.reasoning_content;
+            if (ch?.delta?.content) content += ch.delta.content;
+            if (ch?.finish_reason) finish = ch.finish_reason;
+          }
+          render();
+        }
+      }
+    }
+    render();
+    usageEl.textContent = `finish=${finish || "?"} · in=${usage?.prompt_tokens ?? "?"}${usage?.prompt_cache_hit_tokens ? ` (缓${usage.prompt_cache_hit_tokens})` : ""} · out=${usage?.completion_tokens ?? "?"}`;
+  } catch (e) {
+    usageEl.textContent = "❌ " + e.message;
+  } finally {
+    document.getElementById("pgSend").disabled = false;
+  }
+}
+
+loadModels();
+</script>
+</body>
+</html>

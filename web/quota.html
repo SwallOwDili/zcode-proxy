@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>额度套餐 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div class="toast" id="toast"></div>
+
+<script src="/admin/assets/app.js"></script>
+<script>
+bootPage("quota", "额度套餐", "各账号的套餐、额度池与剩余量");
+
+const C = document.getElementById("pageContent");
+const params = new URLSearchParams(location.search);
+const PICK = params.get("account");
+
+const PLAN_OF = (pl, upid) => (pl.plans?.find((x) => x.userPlanId && x.userPlanId === upid) ?? {}).name;
+
+// ISO(UTC) → 北京时间 YYYY-MM-DD HH:MM:SS
+function fmtFetched(iso) {
+  if (!iso) return "?";
+  const d = new Date(iso);
+  if (isNaN(d)) return esc(iso);
+  return d.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+}
+
+C.innerHTML = `
+  <section class="card">
+    <h2><span class="ico">🎯</span>账号
+      <span class="tools">
+        <select id="accPick" style="width:auto;padding:4px 8px;"></select>
+        <button onclick="load(true)">强制刷新</button>
+      </span>
+    </h2>
+    <div class="hint">选择一个账号查看它的套餐与模型额度池明细。</div>
+  </section>
+  <div id="detail"></div>`;
+
+const detail = document.getElementById("detail");
+const pick = document.getElementById("accPick");
+
+async function load(force = false) {
+  try {
+    const list = await api("/admin/accounts");
+    const names = list.accounts.map((a) => a.name);
+    if (!names.length) {
+      detail.innerHTML = `<section class="card"><div class="empty">暂无账号——先到「添加 / 登录」页接入账号。</div></section>`;
+      pick.innerHTML = "<option>暂无账号</option>";
+      return;
+    }
+    const cur = pick.value && names.includes(pick.value) ? pick.value : (PICK && names.includes(PICK) ? PICK : names[0]);
+    pick.innerHTML = names.map((n) => `<option${n === cur ? " selected" : ""}>${esc(n)}</option>`).join("");
+    await show(cur);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+async function show(name, force = false) {
+  detail.innerHTML = `<section class="card"><div class="empty"><span class="spin"></span> 加载中…</div></section>`;
+  try {
+    const qs = force ? "?refresh=1" : "";
+    const [pl, rfRes] = await Promise.all([
+      api(`/admin/accounts/${encodeURIComponent(name)}/plan${qs}`),
+      api(`/admin/accounts/${encodeURIComponent(name)}/referral${qs}`).catch(() => null),
+    ]);
+    const rf = rfRes && !rfRes.error ? rfRes : null;
+    const acc = (window._accs ?? []).find((a) => a.name === name);
+    const region = acc?.region === "cn" ? "🇨🇳 中国账号" : "🌍 全球账号";
+
+    // 按 userPlanId 关联该套餐下的模型额度
+    const balancesOf = (upid) => (pl.balances ?? []).filter((b) => b.userPlanId === upid);
+    const plans = (pl.plans ?? []).map((x) => {
+      const r = remainOf(x.endsAt);
+      let width = 100, cls = "bar-g";
+      if (r) {
+        cls = r.expired ? "bar-r" : r.totalSecs < 86400 ? "bar-y" : "bar-g";
+        width = 100;
+      }
+      // 该套餐的额度明细
+      const bl = balancesOf(x.userPlanId);
+      const blHtml = bl.length ? `
+        <div style="margin-top:10px;border-top:1px dashed var(--border);padding-top:8px">
+          ${bl.map((b) => {
+            const total = b.total ?? 0;
+            const rem = b.remaining ?? 0;
+            const pct = total > 0 ? Math.max(0, Math.min(100, (rem / total) * 100)) : 0;
+            const bcls = pct > 50 ? "bar-g" : pct > 20 ? "bar-y" : "bar-r";
+            const color = pct > 50 ? "var(--green)" : pct > 20 ? "var(--yellow)" : "var(--red)";
+            return `<div style="margin-bottom:8px">
+              <div style="display:flex;justify-content:space-between;font-size:13px">
+                <span>💰 ${esc(b.name)}</span>
+                <span class="mono" style="color:${color}">${fmtUnits(rem)} <span class="dim">/ ${fmtUnits(total)}</span></span>
+              </div>
+              <div class="bar ${bcls}"><i style="width:${pct.toFixed(1)}%"></i></div>
+              <div class="dim" style="font-size:11px;margin-top:2px">已用 ${fmtUnits(b.used ?? 0)}</div>
+            </div>`;
+          }).join("")}
+        </div>` : `<div style="margin-top:10px;border-top:1px dashed var(--border);padding-top:8px;font-size:12px" class="dim">额度未生效（今晚 23:00 生效后此处显示）</div>`;
+      // 时间进度：套餐已流逝时长 / 总时长（startsAt 若有）
+      const startsAt = x.startsAt ? new Date(x.startsAt).getTime() : null;
+      const endsMs = x.endsAt ? new Date(x.endsAt).getTime() : null;
+      let timePct = 0;
+      if (startsAt && endsMs && endsMs > startsAt) {
+        timePct = Math.max(0, Math.min(100, ((Date.now() - startsAt) / (endsMs - startsAt)) * 100));
+      }
+      return `
+      <div class="qcard" data-ends="${esc(x.endsAt ?? "")}">
+        <div class="t">📦 ${esc(x.name)}</div>
+        <div class="sub">状态 <b style="color:${x.status === "active" ? "var(--green)" : "var(--muted)"}">${esc(x.status)}</b>${x.endsAt ? ` · ${fmtEnds(x.endsAt)} 到期` : ""}</div>
+        ${r ? `<div class="sub countdown" style="margin-top:2px;color:${r.expired ? "var(--red)" : r.totalSecs < 86400 ? "var(--yellow)" : "var(--green)"}">${r.expired ? "⏰ 已过期" : "⏳ " + remainText(r)}</div>
+        <div class="bar ${r.expired ? "bar-r" : timePct > 80 ? "bar-y" : "bar-g"}" title="套餐已进行 ${timePct.toFixed(0)}%"><i style="width:${timePct.toFixed(1)}%"></i></div>` : ""}
+        ${blHtml}
+      </div>`;
+    }).join("") || '<div class="empty">无套餐</div>';
+
+    const linkedUpids = new Set((pl.plans ?? []).map((x) => x.userPlanId).filter(Boolean));
+    const orphan = (pl.balances ?? []).filter((b) => !linkedUpids.has(b.userPlanId));
+    const groups = new Map();
+    for (const b of orphan) {
+      const key = `${b.name}|${PLAN_OF(pl, b.userPlanId) ?? ""}`;
+      const g = groups.get(key) ?? { name: b.name, plan: PLAN_OF(pl, b.userPlanId), total: 0, used: 0, remaining: 0 };
+      g.total += b.total ?? 0; g.used += b.used ?? 0; g.remaining += b.remaining ?? 0;
+      groups.set(key, g);
+    }
+    const balances = [...groups.values()].map((g) => {
+      const pct = g.total > 0 ? Math.max(0, Math.min(100, (g.remaining / g.total) * 100)) : 0;
+      const cls = pct > 50 ? "bar-g" : pct > 20 ? "bar-y" : "bar-r";
+      const color = pct > 50 ? "var(--green)" : pct > 20 ? "var(--yellow)" : "var(--red)";
+      return `
+      <div class="qcard">
+        <div class="t">💰 ${esc(g.name)}</div>
+        <div class="big" style="color:${color}">${fmtUnits(g.remaining)}</div>
+        <div class="sub">剩余 / 总量 ${fmtUnits(g.total)} · 已用 ${fmtUnits(g.used)}${g.plan ? ` · ${esc(g.plan)}` : ""}</div>
+        <div class="bar ${cls}"><i data-w="${pct.toFixed(1)}"></i></div>
+      </div>`;
+    }).join("") || '<div class="empty">无额度数据</div>';
+
+    // 邀请信息区块
+    let refHtml = '<div class="empty">邀请信息不可用</div>';
+    if (rf) {
+      const rows = [];
+      if (rf.inviteLink) {
+        rows.push(`<div class="qcard"><div class="t">🔗 我的邀请链接</div>
+          <div class="sub mono priv">${esc(rf.inviteLink)}</div>
+          <div class="sub">已邀请 <b>${rf.invitedTotal ?? 0}</b> 人 · 本周 ${rf.invitedWeekly ?? 0}${rf.inviterState === "locked" && rf.inviterUnlockedAt ? ` · 资格 ${new Date(rf.inviterUnlockedAt * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })} 解锁` : ""}</div>
+          <div style="margin-top:8px"><button onclick="navigator.clipboard.writeText('${esc(rf.inviteLink)}');toast('📋 已复制')">复制邀请链接</button></div></div>`);
+      } else {
+        rows.push(`<div class="qcard"><div class="t">🔗 邀请资格</div><div class="sub">${rf.inviterState === "locked" && rf.inviterUnlockedAt ? `${new Date(rf.inviterUnlockedAt * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })} 解锁` : "暂无"}</div></div>`);
+      }
+      const tasks = rf.newcomerTasks ?? [];
+      if (tasks.length) {
+        const ICON = { referral_bind_code: "🔗 绑定邀请码", login_device: "💻 登录客户端", send_message: "💬 发送消息" };
+        const allDone = tasks.every((t) => t.completed);
+        rows.push(`<div class="qcard"><div class="t">🧑‍🎓 新手任务 ${allDone ? '<span style="color:var(--green)">全部完成</span>' : ""}</div>
+          ${tasks.map((t) => `<div class="sub">${ICON[t.key] ?? esc(t.key)}　<b style="color:${t.completed ? "var(--green)" : "var(--red)"}">${t.completed ? "✓ 完成" : "✗ 未完成"}</b></div>`).join("")}
+          ${rf.canBind ? `<div style="margin-top:8px"><button onclick="location.href='/admin/bind-captcha.html?account=${encodeURIComponent(name)}'">接受邀请（绑定邀请码）</button></div>` : rf.bindDone ? "" : ""}
+        </div>`);
+      } else if (rf.bindDone) {
+        const inv = rf.invitedBy;
+        rows.push(`<div class="qcard"><div class="t">🧑‍🎓 受邀身份</div>
+          <div class="sub" style="color:var(--green)">✓ 已完成绑定与新手任务</div>
+          ${inv?.name ? `<div class="sub" style="display:flex;align-items:center;gap:6px;margin-top:6px">${inv.avatar ? `<img src="${esc(inv.avatar)}" referrerpolicy="no-referrer" style="width:22px;height:22px;border-radius:50%" onerror="this.style.display='none'">` : "👤"}<span>邀请人：<b class="priv">${esc(inv.name)}</b></span></div>` : ""}
+        </div>`);
+      } else if (rf.invitedBy?.name) {
+        rows.push(`<div class="qcard"><div class="t">🧑‍🎓 受邀身份</div><div class="sub">🤝 被邀请（邀请人 <b class="priv">${esc(rf.invitedBy.name)}</b>）</div></div>`);
+      }
+      const det = rf.inviteesDetail ?? [];
+      if (det.length) {
+        const RN = { night_card: "夜间蹬蹬卡", weekend_card: "周末蹬蹬卡", weekly_reset_card: "周重置卡" };
+        const stateBadge = (iv) => {
+          const t = iv.tasks ?? {};
+          const keys = Object.keys(t);
+          const done = keys.filter((k) => t[k]);
+          // 已绑定但 login_device 未过 → "待登录确认"（上游异步结算，绑定即算邀请关系）
+          if (done.length === keys.length && keys.length) return '<span style="color:var(--green);font-weight:600">✓ 已完成</span>';
+          if (t.referral_bind_code && !t.login_device) return '<span style="color:var(--yellow);font-weight:600">⏳ 待登录客户端确认</span>';
+          return `<span style="color:var(--yellow);font-weight:600">进行中 ${done.length}/${keys.length || 3}</span>`;
+        };
+        const RN_ST = { consumed: "", active: "（生效中）", not_issued: "（待发放：等登录客户端完成）", issued: "（已发放）" };
+        const rewardText = (iv) => {
+          const rs = iv.rewards ?? [];
+          if (!rs.length) return '<span class="dim">—</span>';
+          return rs.map((r) => `${RN[r.type] ?? esc(r.type)}${RN_ST[r.status] ?? `（${esc(r.status)}）`}`).join("、");
+        };
+        const rowsT = det.map((iv) => `
+          <tr>
+            <td><div style="display:flex;align-items:center;gap:6px">${iv.avatar ? `<img src="${esc(iv.avatar)}" referrerpolicy="no-referrer" style="width:22px;height:22px;border-radius:50%" onerror="this.style.display='none'">` : "👤"}<span class="priv mono">${esc(iv.name)}</span></div></td>
+            <td>${stateBadge(iv)}</td>
+            <td>${rewardText(iv)}</td>
+            <td class="mono dim" style="font-size:12px">${iv.boundAt ? new Date(iv.boundAt * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "—"}</td>
+          </tr>`).join("");
+        rows.push(`<div class="qcard" style="grid-column:1/-1"><div class="t">📋 邀请记录（${det.length} 人）</div>
+          <table style="width:100%;border-collapse:collapse;margin-top:8px;font-size:13px">
+            <thead><tr style="text-align:left;color:var(--muted, #8b95a5)"><th style="padding:4px 8px">好友</th><th style="padding:4px 8px">邀请状态</th><th style="padding:4px 8px">好友奖励</th><th style="padding:4px 8px">邀请时间</th></tr></thead>
+            <tbody>${rowsT}</tbody>
+          </table></div>`);
+      }
+      refHtml = `<div class="cards">${rows.join("")}</div>`;
+    }
+    detail.innerHTML = `
+      <section class="card">
+        <h2><span class="ico">👤</span>${esc(name)}
+          <span class="region ${acc?.region === "cn" ? "r-cn" : "r-global"}">${region}</span>
+          <span class="tools dim" style="font-weight:400;font-size:12px;">数据时间 ${fmtFetched(pl.fetchedAt)}${pl.cached === false || pl.realtime ? "（实时）" : "（缓存）"}</span>
+        </h2>
+        <h3>🤝 邀请</h3>
+        ${refHtml}
+        <h3 style="margin-top:18px">📦 套餐</h3>
+        <div class="cards">${plans}</div>
+        ${balances ? `<h3 style="margin-top:18px">💰 未关联赛餐的额度</h3><div class="cards">${balances}</div>` : ""}
+      </section>`;
+
+    requestAnimationFrame(() => setTimeout(() => {
+      document.querySelectorAll(".bar > i[data-w]").forEach((el) => { el.style.width = el.dataset.w + "%"; });
+    }, 60));
+    tickCountdowns();
+  } catch (e) {
+    detail.innerHTML = `<section class="card"><div class="empty">❌ ${esc(e.message)}</div></section>`;
+  }
+}
+
+/* 每秒刷新套餐倒计时（只改文案，不重建 DOM） */
+function tickCountdowns() {
+  const run = () => {
+    document.querySelectorAll(".qcard[data-ends]").forEach((card) => {
+      const r = remainOf(card.dataset.ends);
+      const el = card.querySelector(".countdown");
+      if (!r || !el) return;
+      if (r.expired) { el.textContent = "⏰ 已过期"; el.style.color = "var(--red)"; return; }
+      el.textContent = "⏳ " + remainText(r);
+      el.style.color = r.totalSecs < 86400 ? "var(--yellow)" : "var(--green)";
+    });
+  };
+  run();
+  if (!show._cdTimer) show._cdTimer = setInterval(run, 1000);
+}
+
+pick.addEventListener("change", () => show(pick.value));
+
+load();
+</script>
+</body>
+</html>
