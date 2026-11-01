@@ -5,7 +5,7 @@ services:
     ports:
       - "8787:8787"
     volumes:
-      - ./state:/data/state
+      - ./state:/data/state   # 首次部署：把 zcode-system-prompt.json 放进 ./state/
     environment:
       - ZPROXY_TOKEN=${ZPROXY_TOKEN:-}
       - ZPROXY_DEFAULT_MODEL=${ZPROXY_DEFAULT_MODEL:-GLM-5.3-Flash}

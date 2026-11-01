@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/build/zproxy /usr/local/bin/zproxy
 COPY web /web
+COPY zcode-system-prompt.json /data/state/
 ENV ZPROXY_PORT=8787 \
     ZPROXY_STATE_DIR=/data/state \
     ZPROXY_WEB_DIR=/web
