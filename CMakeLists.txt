@@ -27,9 +27,6 @@ file(GLOB_RECURSE ZPROXY_SRC CONFIGURE_DEPENDS src/*.cpp)
 add_executable(zproxy ${ZPROXY_SRC})
 target_link_libraries(zproxy PRIVATE OpenSSL::SSL OpenSSL::Crypto nlohmann_json::nlohmann_json)
 
-# ---------- 诊断工具 ----------
-target_link_libraries(netcheck2 PRIVATE OpenSSL::SSL OpenSSL::Crypto nlohmann_json::nlohmann_json)
-target_link_libraries(netcheck PRIVATE OpenSSL::SSL OpenSSL::Crypto nlohmann_json::nlohmann_json)
 
 # ---------- 测试 ----------
 enable_testing()
