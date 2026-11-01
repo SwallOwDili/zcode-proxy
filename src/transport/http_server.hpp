@@ -106,6 +106,7 @@ private:
           }
         }
         if (content_length > 8 * 1024 * 1024) {
+          util::log("rejected " + ctx.method + " " + ctx.path + " content_length=" + std::to_string(content_length) + " (>8MB cap)");
           Ctx err;
           err.set_status(413);
           err.set_content(R"({"error":{"message":"payload too large (8MB limit) - reduce conversation history"}})", "application/json");
