@@ -28,13 +28,6 @@ add_executable(zproxy ${ZPROXY_SRC})
 target_link_libraries(zproxy PRIVATE OpenSSL::SSL OpenSSL::Crypto nlohmann_json::nlohmann_json)
 
 # ---------- 诊断工具 ----------
-add_executable(pick_bench tools/pick_bench.cpp)
-target_link_libraries(pick_bench PRIVATE OpenSSL::SSL OpenSSL::Crypto nlohmann_json::nlohmann_json)
-add_executable(netcheck tools/netcheck.cpp)
-add_executable(netcheck4 tools/netcheck4.cpp)
-target_link_libraries(netcheck4 PRIVATE OpenSSL::SSL OpenSSL::Crypto nlohmann_json::nlohmann_json)
-add_executable(netcheck3 tools/netcheck3.cpp)
-target_link_libraries(netcheck3 PRIVATE OpenSSL::SSL OpenSSL::Crypto nlohmann_json::nlohmann_json)
 add_executable(netcheck2 tools/netcheck2.cpp)
 target_link_libraries(netcheck2 PRIVATE OpenSSL::SSL OpenSSL::Crypto nlohmann_json::nlohmann_json)
 target_link_libraries(netcheck PRIVATE OpenSSL::SSL OpenSSL::Crypto nlohmann_json::nlohmann_json)
