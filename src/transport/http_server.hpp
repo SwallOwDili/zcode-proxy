@@ -109,8 +109,28 @@ private:
           util::log("rejected " + ctx.method + " " + ctx.path + " content_length=" + std::to_string(content_length) + " (>64MB cap)");
           Ctx err;
           err.set_status(413);
+          err.set_header("Connection", "close");
           err.set_content(R"({"error":{"message":"payload too large (64MB limit) - reduce conversation history or attachments"}})", "application/json");
           co_await write_simple(*sock, err, false);
+          // 客户端此刻多半仍在上传 body：读完并丢弃（有界）后再关连接，
+          // 否则 close 会掐断上传，客户端只见 EPIPE 而收不到这条 413
+          {
+            size_t drain = std::min(content_length, (size_t)128 * 1024 * 1024);
+            char scratch[65536];
+            while (drain) {
+              if (buf.size()) {
+                size_t n = (size_t)std::min<uint64_t>(drain, buf.size());
+                buf.consume(n);
+                drain -= n;
+                continue;
+              }
+              asio::error_code ec;
+              size_t n = co_await sock->async_read_some(asio::buffer(scratch),
+                                                        asio::redirect_error(asio::use_awaitable, ec));
+              if (ec) break;
+              drain -= std::min(drain, n);
+            }
+          }
           break;
         }
         // Expect: 100-continue：客户端等 interim 响应再发 body（undici 对大 body 会用）
