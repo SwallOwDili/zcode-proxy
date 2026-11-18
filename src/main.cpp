@@ -57,9 +57,18 @@ int main(int argc, char** argv) {
   zproxy::server::Router router(*ctx);
   router.setup(server);
 
-  // 停机监视：信号只置标志，落盘由本线程完成（不在信号上下文做 IO/锁）
+  // 停机监视：信号只置标志，收尾由本线程完成（不在信号上下文做 IO/锁）。
+  // 先排空在途请求（此前立即 exit 掐断上传/SSE 流——客户端大量 EPIPE 的直接来源），再落盘退出
   std::thread([&] {
     while (!g_shutdown) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    int drain_s = zproxy::util::env::i64("ZPROXY_DRAIN_TIMEOUT_S", 30);
+    int inflight = server.initiate_shutdown();
+    if (inflight > 0) {
+      zproxy::util::log("shutdown: draining " + std::to_string(inflight) +
+                        " in-flight request(s), up to " + std::to_string(drain_s) + "s...");
+      bool done = server.drain_wait(drain_s);
+      zproxy::util::log(std::string("shutdown: drain ") + (done ? "complete" : "timeout, cutting remaining"));
+    }
     zproxy::util::log("shutdown signal received, flushing...");
     if (g_flush) g_flush();
     std::exit(0); // flush 已同步完成；asio acceptor 随进程终止

@@ -86,7 +86,8 @@ public:
     if (bal.is_object() && bal.contains("data") && bal["data"].contains("plans") && bal["data"]["plans"].is_array()) {
       for (auto& p : bal["data"]["plans"]) {
         std::string pid = p.value("plan_id", "");
-        if (pid.find("start-plan-" + tag) != std::string::npos &&
+        // plan_id 形如 zcode-v3-start-plan-gb-1104（中间可能夹 gb/其它段），不能写死 "start-plan-"+日期
+        if (pid.find("start-plan-") != std::string::npos && pid.find(tag) != std::string::npos &&
             std::find(candidates.begin(), candidates.end(), pid) == candidates.end())
           candidates.push_back(pid);
       }
@@ -257,8 +258,7 @@ public:
       bool has_campaign = false;
       for (auto& p : plans) {
         std::string s = p.get<std::string>();
-        if (s.find("start-plan-") != std::string::npos && s.find("0817") == std::string::npos &&
-            s.find("referral") == std::string::npos)
+        if (s.find("start-plan-") != std::string::npos && s.find("referral") == std::string::npos)
           has_campaign = true;
       }
       if (need_app_login) need.push_back(a.name);
@@ -324,7 +324,10 @@ private:
     if (!balance_data.contains("plans") || !balance_data["plans"].is_array()) return false;
     for (auto& p : balance_data["plans"]) {
       std::string pid = p.value("plan_id", "");
-      if (p.value("status", "") == "active" && pid.find("start-plan-" + tag) != std::string::npos) return true;
+      // 同上：pid 可能是 zcode-v3-start-plan-gb-1104，日期段不在固定位置
+      if (p.value("status", "") == "active" && pid.find("start-plan-") != std::string::npos &&
+          pid.find(tag) != std::string::npos)
+        return true;
     }
     return false;
   }

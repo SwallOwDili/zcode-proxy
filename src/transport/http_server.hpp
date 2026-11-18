@@ -3,6 +3,7 @@
 #include <asio.hpp>
 #include <asio/use_awaitable.hpp>
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <regex>
 #include "http_ctx.hpp"
@@ -37,20 +38,48 @@ public:
   }
 
   asio::awaitable<void> listen(const std::string& host, int port) {
-    tcp::acceptor acc(io_);
+    auto acc = std::make_shared<tcp::acceptor>(io_);
+    acc_ = acc;
     tcp::endpoint ep(asio::ip::make_address(host), (unsigned short)port);
-    acc.open(ep.protocol());
-    acc.set_option(asio::socket_base::reuse_address(true));
-    acc.bind(ep);
-    acc.listen(asio::socket_base::max_listen_connections);
+    acc->open(ep.protocol());
+    acc->set_option(asio::socket_base::reuse_address(true));
+    acc->bind(ep);
+    acc->listen(asio::socket_base::max_listen_connections);
     util::log("asio listening on " + host + ":" + std::to_string(port));
     for (;;) {
-      auto socket = std::make_shared<tcp::socket>(co_await acc.async_accept(asio::use_awaitable));
+      std::error_code ec;
+      auto socket = std::make_shared<tcp::socket>(
+          co_await acc->async_accept(asio::redirect_error(asio::use_awaitable, ec)));
+      if (ec) {
+        if (stopping_) co_return; // 停机关 acceptor：正常退出监听
+        util::log("accept error: " + ec.message());
+        continue;
+      }
+      asio::error_code nec;
+      socket->set_option(asio::ip::tcp::no_delay(true), nec); // SSE 小帧免 Nagle/delayed-ACK 延迟
       asio::co_spawn(io_, session(socket), asio::detached);
     }
   }
 
+  // 停机第一步：置标志 + 关 acceptor（停止接入新连接），返回当前在途会话数
+  int initiate_shutdown() {
+    stopping_ = true;
+    if (auto acc = acc_.lock()) asio::post(io_, [acc] { std::error_code ec; acc->close(ec); });
+    return active_.load();
+  }
+  // 停机第二步：等在途会话（含 SSE 流）结束，最多 timeout_s 秒
+  bool drain_wait(int timeout_s) {
+    std::unique_lock<std::mutex> lk(drain_mu_);
+    return drain_cv_.wait_for(lk, std::chrono::seconds(timeout_s), [&] { return active_.load() == 0; });
+  }
+
 private:
+  std::atomic<bool> stopping_{false};
+  std::atomic<int> active_{0}; // 在途会话数（排空停机用）
+  std::mutex drain_mu_;
+  std::condition_variable drain_cv_;
+  std::weak_ptr<tcp::acceptor> acc_;
+
   static asio::awaitable<std::string> read_until_headers(tcp::socket& s, asio::streambuf& buf) {
     std::string headers;
     char c;
@@ -69,6 +98,18 @@ private:
       for (;;) { // keep-alive 循环
         // ---- 请求头 ----
         std::string raw = co_await read_until_headers(*sock, buf);
+        // 请求级在途计数（空闲 keep-alive 连接不计）：读到请求头即视为在途，响应写完解除
+        active_++;
+        struct ReqGuard {
+          HttpServer* s;
+          ~ReqGuard() {
+            {
+              std::lock_guard<std::mutex> lk(s->drain_mu_);
+              s->active_--;
+            }
+            s->drain_cv_.notify_all();
+          }
+        } req_guard{this};
         auto line_end = raw.find("\r\n");
         std::string reqline = raw.substr(0, line_end);
         auto sp1 = reqline.find(' ');

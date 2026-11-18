@@ -38,8 +38,8 @@ function toast(msg, isErr) {
   t.style.background = isErr ? "#7f1d1d" : "#14532d";
   setTimeout(() => { t.style.display = "none"; }, 6000);
 }
-window.AliyunCaptchaConfig = { region: "cn", prefix: "no8xfe" };
 let bindDone = false;
+let captchaCfg = null; // 官方实时的 region/prefix/sceneId（region 曾由 cn 改 sgp，硬编码会全部 3007）
 async function doBind(captchaVerifyParam) {
   if (bindDone) return;
   bindDone = true;
@@ -48,12 +48,13 @@ async function doBind(captchaVerifyParam) {
     const r = await fetch(`/admin/accounts/${encodeURIComponent(account)}/bind-referral`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ invite_code: code, captchaVerifyParam }),
+      body: JSON.stringify({ invite_code: code, captchaVerifyParam,
+        captcha_region: captchaCfg?.region ?? "sgp" }),
     });
     const j = await r.json();
     const el = document.getElementById("bindResult");
     if (j.ok) { el.innerHTML = `<span class="bind-ok">✅ 绑定成功！${account} 已接受 ${code} 的邀请。接下来在新账号里完成「登录客户端 + 发送一条消息」即可拿满新手奖励。</span>`; toast("绑定成功"); }
-    else { el.innerHTML = `<span class="bind-err">❌ 绑定失败：${j.message ?? JSON.stringify(j)}</span>`; bindDone = false; }
+    else { el.innerHTML = `<span class="bind-err">❌ 绑定失败：${j.message ?? JSON.stringify(j)}</span>`; } // 上游已明确拒绝：不再自动重试（SDK 重触发会连环打上游）
   } catch (e) {
     document.getElementById("bindResult").innerHTML = `<span class="bind-err">❌ 请求异常：${e.message}</span>`;
     bindDone = false;
@@ -61,7 +62,11 @@ async function doBind(captchaVerifyParam) {
 }
 window.bindCode = code;
 (async () => {
-  window.AliyunCaptchaConfig = { region: "cn", prefix: "no8xfe" };
+  try {
+    const cr = await fetch("/admin/captcha-config");
+    if (cr.ok) captchaCfg = await cr.json();
+  } catch {}
+  window.AliyunCaptchaConfig = { region: captchaCfg?.region ?? "sgp", prefix: captchaCfg?.prefix ?? "no8xfe" };
   await new Promise((resolve, reject) => {
     const s = document.createElement("script");
     s.src = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
@@ -70,7 +75,7 @@ window.bindCode = code;
     document.head.appendChild(s);
   });
   window.initAliyunCaptcha({
-    SceneId: "11xygtvd",
+    SceneId: captchaCfg?.sceneId ?? "11xygtvd",
     mode: "popup",
     language: "cn",
     element: "#captcha-element",

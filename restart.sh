@@ -8,10 +8,11 @@ echo "▶ 重启 zcode-proxy-cpp ($PROXY_DIR)"
 OLD=$(lsof -nP -tiTCP:$PORT -sTCP:LISTEN 2>/dev/null || true)
 if [ -n "$OLD" ]; then
   kill -TERM $OLD 2>/dev/null || true
-  for i in {1..20}; do
+  # 优雅排空：在途 SSE/上传最长 30s 跑完，宽限到 35s 再强杀——此前 2s 就 SIGKILL，客户端见大量 EPIPE
+  for i in {1..70}; do
     [ -z "$(lsof -nP -tiTCP:$PORT -sTCP:LISTEN 2>/dev/null || true)" ] && break
-    sleep 0.3
-    (( i == 7 )) && { kill -9 $OLD 2>/dev/null || true; echo "▶ TERM 未退出，已 SIGKILL"; }
+    sleep 0.5
+    (( i == 70 )) && { kill -9 $OLD 2>/dev/null || true; echo "▶ 排空超时（35s），已 SIGKILL"; }
   done
   RESIDUE=$(lsof -nP -tiTCP:$PORT -sTCP:LISTEN 2>/dev/null || true)
   if [ -n "$RESIDUE" ]; then kill -9 $RESIDUE 2>/dev/null; sleep 0.5; echo "▶ 已强杀残留监听进程"; fi

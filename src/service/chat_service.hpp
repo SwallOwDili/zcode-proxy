@@ -79,6 +79,7 @@ private:
       protocol::StreamTranslator tr(id, out_model);
       protocol::SseParser parser;
       bool saw_text = false;
+      bool client_gone = false; // 写客户端失败（对端已断）——必须立刻止损，不许再拿上游重试
       std::string error_event;
       std::string account;
       int64_t first_delta_wall = 0;
@@ -101,6 +102,7 @@ private:
             if (dump) std::fwrite(frame.data(), 1, frame.size(), dump);
             if (!co_await write_sse_frame(ctx, frame)) {
               util::log("SSE WRITE FAILED to client: frame=" + std::to_string(sent_frames) + " bytes=" + std::to_string(sent_bytes));
+              client_gone = true;
               if (dump) std::fclose(dump);
               co_return false;
             }
@@ -121,6 +123,15 @@ private:
       ctx_.tps.run_end(tps_id, 0);
       int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
+      if (client_gone) {
+        // 客户端连接已断：上游无辜（不冷却）、重试无意义（写了也无人收，还会白烧一次 35MB 上传）
+        util::log("client gone, abort stream id=" + id + " account=" + account +
+                  " frames=" + std::to_string(sent_frames));
+        domain::RecentEntry e; e.kind = "chat/stream"; e.model = model; e.account = account;
+        e.status = 499; e.ms = ms; e.note = "client-gone";
+        ctx_.record(e);
+        co_return;
+      }
       bool premature = call.is_stream() && !tr.saw_stop();
 
       auto sse_err = [&](const std::string& msg) -> asio::awaitable<void> {
@@ -137,7 +148,10 @@ private:
       };
 
       if (call.business_error.is_object()) {
-        if (co_await retry_or(!saw_text && attempt == 0, detail::biz_message(call.business_error))) continue;
+        // code=-1 是 anthropic 风格请求级错误（prompt too long 等）的合成标记：换号无意义，不重试
+        bool can_retry = !saw_text && attempt == 0 &&
+                         call.business_error.value("code", (int64_t)0) != -1;
+        if (co_await retry_or(can_retry, detail::biz_message(call.business_error))) continue;
         domain::RecentEntry e; e.kind = "chat/stream"; e.model = model; e.account = account;
         e.status = detail::biz_status(call.business_error); e.ms = ms;
         ctx_.record(e);
@@ -172,6 +186,16 @@ private:
           continue;
         domain::RecentEntry e; e.kind = "chat/stream"; e.model = model; e.account = account;
         e.status = 502; e.ms = ms; e.note = "premature-close";
+        ctx_.record(e);
+        co_return;
+      }
+      if (tr.event_count() == 0) {
+        // 兜底：0 事件绝不冒充成功发空 [DONE]（此前 33MB 大请求被上游非流式拒绝时客户端只见空回复）
+        if (co_await retry_or(true, "upstream returned empty stream (0 events)" +
+                                        (call.body.empty() ? std::string() : ": " + call.body.substr(0, 200))))
+          continue;
+        domain::RecentEntry e; e.kind = "chat/stream"; e.model = model; e.account = account;
+        e.status = 502; e.ms = ms; e.note = "empty-stream";
         ctx_.record(e);
         co_return;
       }

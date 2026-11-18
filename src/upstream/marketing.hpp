@@ -33,10 +33,31 @@ inline nlohmann::json curl_post_json(const std::string& url, const Headers& head
   try { return nlohmann::json::parse(r.stdout_data); } catch (...) { return nullptr; }
 }
 
+// curl POST 保留原始结果（状态不可知，仅 stdout 原文 + 失败原因）——bind 风控失败必须能看见原文
+struct CurlPostRaw {
+  bool timed_out = false;
+  bool spawn_failed = false;
+  int exit_code = -1;
+  std::string body; // curl stdout 原文（可能为空/HTML/JSON）
+};
+inline CurlPostRaw curl_post_raw(const std::string& url, const Headers& headers, const nlohmann::json& body) {
+  std::vector<std::string> argv{"curl", "-s", "-X", "POST", url};
+  for (auto& [k, v] : headers) { argv.push_back("-H"); argv.push_back(k + ": " + v); }
+  argv.push_back("--data");
+  argv.push_back(body.dump());
+  argv.push_back("--max-time");
+  argv.push_back("20");
+  auto r = util::exec::run(argv, 25'000);
+  return CurlPostRaw{r.timed_out, r.spawn_failed, r.exit_code, std::move(r.stdout_data)};
+}
+
 // marketing/touch 扫描 claim 按钮（6s 硬超时；拿不到靠日期规律兜底）
 struct TouchPlan {
   std::string campaign_id;
   std::string plan_id;
+  std::string plan_name;   // 活动名（如 ZCODE GLOBAL BUILD）
+  int64_t grant_units = 0; // 权益 token 数（0=未知）
+  std::string show_name;   // 权益展示名（如 GLM-5.3-Flash）
 };
 inline std::optional<TouchPlan> extract_touch_plan_id(const std::string& jwt, const std::string& device_mid,
                                                       const std::string& app_version) {
@@ -57,7 +78,27 @@ inline std::optional<TouchPlan> extract_touch_plan_id(const std::string& jwt, co
         const auto& act = b["action"];
         if (act.value("type", "") == "claim_zcode_plan" && act.contains("args") &&
             act["args"].is_object() && act["args"].contains("plan_id")) {
-          return TouchPlan{dd.value("campaign_id", ""), act["args"].value("plan_id", "")};
+          TouchPlan tp{dd.value("campaign_id", ""), act["args"].value("plan_id", ""), "", 0, ""};
+          // 活动元数据在 background/hero 的 args.zcode_plan（客户端渲染弹窗用的同一份数据）
+          const nlohmann::json* zp = nullptr;
+          for (const char* meta : {"background", "hero"}) {
+            if (!dd[kind].contains(meta) || !dd[kind][meta].is_object() ||
+                !dd[kind][meta].contains("args") || !dd[kind][meta]["args"].is_object() ||
+                !dd[kind][meta]["args"].contains("zcode_plan"))
+              continue;
+            zp = &dd[kind][meta]["args"]["zcode_plan"];
+            break;
+          }
+          if (zp && zp->contains("entitlements") && (*zp)["entitlements"].is_array() &&
+              !(*zp)["entitlements"].empty()) {
+            tp.plan_name = zp->value("name", "");
+            const auto& ent = (*zp)["entitlements"][0];
+            if (ent.is_object()) {
+              tp.show_name = ent.value("show_name", "");
+              tp.grant_units = ent.value("grant_units", (int64_t)0);
+            }
+          }
+          return tp;
         }
       }
     }

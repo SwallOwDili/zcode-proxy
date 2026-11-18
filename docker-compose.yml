@@ -8,4 +8,5 @@ services:
       - ./state:/data/state   # 首次部署：把 zcode-system-prompt.json 放进 ./state/
     environment:
       - ZPROXY_HOST=0.0.0.0   # 容器内监听所有接口，否则端口映射后外部无法访问
+    stop_grace_period: 35s    # 配合进程内 30s 优雅排空（docker 默认 10s 就 SIGKILL，客户端会看到 EPIPE）
     restart: unless-stopped

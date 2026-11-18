@@ -14,6 +14,7 @@
 #include "upstream/marketing.hpp"
 #include "nlohmann/json.hpp"
 #include "service/app_context.hpp"
+#include "util/log.hpp"
 #include "util/time_util.hpp"
 #include "util/uuid.hpp"
 
@@ -419,26 +420,166 @@ public:
         c.set_content(err("缺少邀请码").dump(), "application/json");
         return;
       }
+      // 同账号绑定限速：SDK 重触发/重复提交不许连环打上游（每次都是真上游调用）
+      {
+        std::lock_guard<std::mutex> lk(bind_rate_mu_);
+        int64_t now = util::time_util::now_ms();
+        auto& last = bind_last_attempt_[name];
+        if (now - last < 10'000) {
+          c.set_status(429);
+          c.set_content(err("绑定请求过于频繁，请 10 秒后再试").dump(), "application/json");
+          return;
+        }
+        last = now;
+      }
       std::string cap = util::trim(body.value("captchaVerifyParam", std::string()));
-      upstream::Headers h = {
-        {"Authorization", "Bearer " + jwt}, {"Content-Type", "application/json"},
-        {"X-Device-Mid", dm}, {"X-Client-Language", "zh-CN"},
-        {"User-Agent", "ZCode/" + ctx_.cfg.app_version}, {"X-ZCode-App-Version", ctx_.cfg.app_version},
-        {"X-Platform", "darwin-arm64"}, {"HTTP-Referer", "https://zcode.z.ai"},
-        {"X-Aliyun-Captcha-Verify-Region", "cn"},
-      };
+      std::string cap_region = util::trim(body.value("captcha_region", std::string("sgp")));
+      // 头集合对齐 fetch_referral/claim（同一上游风控域实测可过的组合），再叠加 captcha 两头
+      upstream::Headers h = upstream::claim_headers(jwt, dm, ctx_.cfg.app_version);
+      h.emplace_back("Accept", "application/json");
+      h.emplace_back("X-Aliyun-Captcha-Verify-Region", cap_region);
       if (!cap.empty()) h.emplace_back("X-Aliyun-Captcha-Verify-Param", cap);
-      auto out = upstream::curl_post_json("https://zcode.z.ai/api/v1/incentive/referral/bind-code", h,
-                                          {{"invite_code", code}});
+      auto raw = upstream::curl_post_raw("https://zcode.z.ai/api/v1/incentive/referral/bind-code", h,
+                                         {{"invite_code", code}});
+      nlohmann::json out = nullptr;
+      try { out = nlohmann::json::parse(raw.body); } catch (...) {}
       int64_t bcode = out.is_object() ? out.value("code", (int64_t)-1) : -1;
       if (bcode == 0) {
         c.set_content(nlohmann::json{{"ok", true}, {"name", name}, {"code", code}}.dump(), "application/json");
         return;
       }
-      std::string msg = bcode == 3007 ? "需要人机验证（验证码），请在浏览器里完成绑定"
-                        : bcode == 3006 ? "不在新用户资格窗口内"
-                                    : (out.is_object() ? out.value("msg", std::string("绑定失败")) : std::string("绑定失败"));
+      // 失败必须留痕：超时/非 JSON/上游 msg 原文都进日志（此前只剩泛化「绑定失败」无从排查）
+      std::string raw_snip = raw.body.substr(0, 500);
+      util::log("bind-referral " + name + " invite=" + code + " bcode=" + std::to_string(bcode) +
+                (raw.timed_out ? " timed_out" : "") + (raw.spawn_failed ? " spawn_failed" : "") +
+                " curl_exit=" + std::to_string(raw.exit_code) + " body=" + raw_snip);
+      // 错误文案对齐官网 invite 页（3006 旧映射是错的：官方「资格窗口」是 3507，3007=验证未通过）
+      static const std::map<int64_t, std::string> kBindMsgs = {
+          {401, "登录已失效，请重新登录该账号"}, {1006, "登录已失效，请重新登录该账号"},
+          {3007, "安全验证未通过，请刷新页面重试"},
+          {3501, "邀请活动暂未开放"}, {3502, "当前账号不符合参与条件"},
+          {3503, "邀请链接无效，请向好友获取新的链接"}, {3504, "不能接受自己的邀请"},
+          {3505, "已绑定过邀请，无法重复接受"}, {3506, "邀请人暂未获得邀请资格"},
+          {3507, "已超过新用户参与时限，无法接受邀请"},
+      };
+      auto it_msg = kBindMsgs.find(bcode);
+      std::string msg = it_msg != kBindMsgs.end() ? it_msg->second
+                      : raw.timed_out ? "上游超时（20s 无响应）"
+                      : raw.spawn_failed ? "curl 启动失败"
+                      : out.is_object()
+                          ? "上游拒绝 code=" + std::to_string(bcode) + ": " + out.value("msg", std::string())
+                      : !raw.body.empty() ? "上游非 JSON 响应: " + raw_snip
+                                          : "上游无响应（curl exit " + std::to_string(raw.exit_code) + "）";
       c.set_content(nlohmann::json{{"ok", false}, {"code", bcode}, {"message", msg}, {"captcha", bcode == 3007}}.dump(),
+                      "application/json");
+    }));
+
+    // 官方 captcha 配置实时代理（region 会变：cn→sgp 曾导致绑定全部 3007）；失败兜底最近已知值
+    REG("GET", "/admin/captcha-config", H([this](http::Ctx& c) {
+      nlohmann::json fallback = {{"enabled", true}, {"prefix", "no8xfe"}, {"region", "sgp"},
+                                 {"sceneId", "11xygtvd"}, {"skip_model_request", true}};
+      auto res = upstream::http::get_json("https://zcode.z.ai", "/api/v1/client/configs",
+                                {{"User-Agent", "ZCode/" + ctx_.cfg.app_version}}, 10);
+      nlohmann::json j;
+      try { j = nlohmann::json::parse(res.body); } catch (...) { j = nullptr; }
+      nlohmann::json cap = j.is_object() && j.contains("data") && j["data"].contains("configs") &&
+                                   j["data"]["configs"].contains("captcha")
+                               ? j["data"]["configs"]["captcha"]
+                               : nlohmann::json(nullptr);
+      if (!cap.is_object() || cap.value("region", std::string()).empty() ||
+          cap.value("prefix", std::string()).empty() || cap.value("sceneId", std::string()).empty()) {
+        util::log("captcha-config: upstream missing/incomplete, using fallback (status=" +
+                  std::to_string(res.status) + ")");
+        cap = fallback;
+      }
+      c.set_content(cap.dump(), "application/json");
+    }));
+
+    // 各账号当前可领取的活动（touch 投放里有 claim_zcode_plan 按钮的）
+    REG("GET", "/admin/claim/opportunities", H([this](http::Ctx& c) {
+      nlohmann::json items = nlohmann::json::array();
+      for (auto& a : ctx_.pool.accounts()) {
+        if (a.jwt.empty()) continue;
+        std::string dm = a.device_mid.empty() ? util::uuid() : a.device_mid;
+        auto tp = upstream::extract_touch_plan_id(a.jwt, dm, ctx_.cfg.app_version);
+        if (!tp) continue;
+        items.push_back({{"name", a.name},
+                         {"campaign_id", tp->campaign_id},
+                         {"plan_id", tp->plan_id},
+                         {"plan_name", tp->plan_name},
+                         {"show_name", tp->show_name},
+                         {"grant_units", tp->grant_units}});
+      }
+      c.set_content(nlohmann::json{{"ok", true}, {"items", items}}.dump(), "application/json");
+    }));
+
+    // 手动领取（浏览器生成验证参数后提交，对齐客户端 claimManualPlan：
+    // POST billing/claim + X-Aliyun-Captcha-Verify-Param/Region 头）
+    REG("POST", R"(/admin/accounts/([^/]+)/claim-plan)", H([this](http::Ctx& c) {
+      std::string name = c.params[0];
+      auto body = parse(c);
+      auto acc = ctx_.pool.get(name);
+      if (!acc) {
+        c.set_status(404);
+        c.set_content(err("no such account").dump(), "application/json");
+        return;
+      }
+      std::string plan_id = util::trim(body.value("plan_id", std::string()));
+      std::string cap = util::trim(body.value("captchaVerifyParam", std::string()));
+      std::string cap_region = util::trim(body.value("captcha_region", std::string("sgp")));
+      if (plan_id.empty()) {
+        c.set_status(400);
+        c.set_content(err("缺少 plan_id").dump(), "application/json");
+        return;
+      }
+      {
+        std::lock_guard<std::mutex> lk(bind_rate_mu_);
+        int64_t now = util::time_util::now_ms();
+        auto& last = bind_last_attempt_["claim:" + name];
+        if (now - last < 8'000) {
+          c.set_status(429);
+          c.set_content(err("领取请求过于频繁，请 8 秒后再试").dump(), "application/json");
+          return;
+        }
+        last = now;
+      }
+      std::string dm = acc->device_mid.empty() ? util::uuid() : acc->device_mid;
+      upstream::Headers h = upstream::claim_headers(acc->jwt, dm, ctx_.cfg.app_version);
+      h.emplace_back("Accept", "application/json");
+      if (!cap.empty()) {
+        h.emplace_back("X-Aliyun-Captcha-Verify-Param", cap);
+        h.emplace_back("X-Aliyun-Captcha-Verify-Region", cap_region);
+      }
+      auto raw = upstream::curl_post_raw(std::string(upstream::kClaimBase) + "/api/v1/zcode-plan/billing/claim", h,
+                                         {{"plan_id", plan_id}});
+      nlohmann::json out = nullptr;
+      try { out = nlohmann::json::parse(raw.body); } catch (...) {}
+      int64_t bcode = out.is_object() ? out.value("code", (int64_t)-1) : -1;
+      bool granted = bcode == 0 && out.contains("data") && out["data"].is_object() &&
+                     out["data"].contains("plan");
+      if (granted) {
+        util::log("[claim-manual] " + name + " ✅ " + plan_id + " 已领取");
+        c.set_content(nlohmann::json{{"ok", true}, {"name", name}, {"plan_id", plan_id}}.dump(),
+                        "application/json");
+        return;
+      }
+      std::string raw_snip = raw.body.substr(0, 500);
+      util::log("[claim-manual] " + name + " " + plan_id + " bcode=" + std::to_string(bcode) +
+                (raw.timed_out ? " timed_out" : "") + " curl_exit=" + std::to_string(raw.exit_code) +
+                " body=" + raw_snip);
+      static const std::map<int64_t, std::string> kClaimMsgs = {
+          {1003, "上游返回已领取"}, {3007, "安全验证未通过，请重试"}, {401, "登录已失效"},
+      };
+      auto it_msg = kClaimMsgs.find(bcode);
+      std::string msg = it_msg != kClaimMsgs.end() ? it_msg->second
+                      : raw.timed_out ? "上游超时（20s 无响应）"
+                      : out.is_object() && out.contains("msg") && out["msg"].is_string()
+                          ? "上游拒绝 code=" + std::to_string(bcode) + ": " + out["msg"].get<std::string>()
+                      : out.is_object()
+                          ? "上游拒绝 code=" + std::to_string(bcode)
+                      : !raw.body.empty() ? "上游非 JSON 响应: " + raw_snip
+                                          : "上游无响应（curl exit " + std::to_string(raw.exit_code) + "）";
+      c.set_content(nlohmann::json{{"ok", false}, {"code", bcode}, {"message", msg}}.dump(),
                       "application/json");
     }));
 
@@ -513,6 +654,8 @@ private:
   struct RefCacheEntry { nlohmann::json data; int64_t at = 0; };
   std::mutex ref_mu_;
   std::map<std::string, RefCacheEntry> ref_cache_; // jwt → 缓存
+  std::mutex bind_rate_mu_;
+  std::map<std::string, int64_t> bind_last_attempt_; // 账号 → 上次绑定请求时刻（限速防连环提交）
   std::map<std::string, PlanCacheEntry> plan_cache_;
   std::mutex pb_mu_;
   nlohmann::json pool_balance_cache_;

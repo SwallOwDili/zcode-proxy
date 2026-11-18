@@ -48,6 +48,15 @@ inline std::string client_system_to_text(const nlohmann::json& system) {
 
 inline nlohmann::json with_injected_system(nlohmann::json body,
                                            const std::vector<nlohmann::json>& required_blocks) {
+  // 客户端自带 ZCode 原生 system（首块即身份块）= 请求本就与真实客户端同构：整段透传，不再注入。
+  // 此前 /v1/messages 透传会在客户端新 prompt 前再拼一份（可能过期的）注入块，形成新旧混杂的
+  // system 指纹——上游风控按此软封禁（响应被审核分类器接管，返回 <block>no/<severity>0）。
+  if (body.contains("system") && body["system"].is_array() && !body["system"].empty()) {
+    const auto& first = body["system"][0];
+    if (first.is_object() && first.value("type", "") == "text" &&
+        first.value("text", std::string()).rfind("You are ZCode", 0) == 0)
+      return std::move(body);
+  }
   // system = [ZCode身份块, ZCode主段(会话路径随机化), ...客户端system块]
   // 消融实验：WAF 要求前两块开头（缺一 405），客户端块可追加尾部；第三块非必须
   nlohmann::json sys = nlohmann::json::array();
@@ -175,6 +184,7 @@ public:
     int tries = std::max((int)pool_.size(), 1);
     int had_status = 0;
     std::string last_content_type;
+    std::string last_body;
     const std::string payload_model = payload.value("model", std::string());
     std::string body_str = payload.dump(); // 只 dump 一次（此前每个账号尝试都重 dump 全量 body）
     payload = nlohmann::json();            // payload DOM 立即释放：上游流式期间只留 body_str
@@ -186,13 +196,30 @@ public:
       out.account_name = *name;
       Headers headers = combine_zcode_endpoint(build_upstream_caller(lease), lease.jwt, lease.device_mid,
                                                lease.app_version);
+      // 调试转储（重放定位用）：ZPROXY_DUMP_REQUEST=1 时写 /tmp/zproxy-last-req.json（与阻塞版 call 一致）
+      if (util::fs::getenv_str("ZPROXY_DUMP_REQUEST")) {
+        nlohmann::json dump;
+        dump["headers"] = headers; // pair 序列化为 ["k","v"]
+        dump["body_len"] = body_str.size();
+        dump["body"] = body_str;
+        util::fs::write_file("/tmp/zproxy-last-req.json", dump.dump());
+      }
       auto t0 = std::chrono::steady_clock::now();
       auto res = co_await zhttp::co_post_stream(cfg_.upstream, zhttp::full_path(cfg_.upstream, "/v1/messages"), headers, body_str, on_chunk);
       int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
       util::log("upstream account=" + *name + " status=" + std::to_string(res.status) + " ms=" +
                 std::to_string(ms) + (res.error.empty() ? "" : " err=" + res.error));
-      if (!res.ok()) { pool_.release(*name); continue; }
+      if (!res.ok()) {
+        pool_.release(*name);
+        if (res.delivered_any) {
+          // 中途断流且已向客户端递送过帧：换号重发会在同一条客户端 SSE 流里注入第二份
+          // message_start（流已污染），只能就此返回，交由上层 premature 语义收尾
+          out.status = res.status; out.content_type = res.content_type; out.body = res.error;
+          co_return out;
+        }
+        continue;
+      }
       pool_.release(*name);
       had_status = res.status;
       last_content_type = res.content_type;
@@ -208,7 +235,8 @@ public:
             if (!lease2.valid) break;
             Headers h2 = combine_zcode_endpoint(build_upstream_caller(lease2), lease2.jwt, lease2.device_mid,
                                                 lease2.app_version);
-            auto res2 = co_await zhttp::co_post_stream(cfg_.upstream, "/v1/messages", h2, body_str, on_chunk);
+            // 必须与上方主调用一样带 base_url 路径前缀（此前丢前缀：3009 恢复请求打到错误 URL 直接 404）
+            auto res2 = co_await zhttp::co_post_stream(cfg_.upstream, zhttp::full_path(cfg_.upstream, "/v1/messages"), h2, body_str, on_chunk);
             pool_.release(*name);
             res = res2;
             if (res.status != 429) { recovered = true; break; }
@@ -241,6 +269,29 @@ public:
           out.business_error = j;
           co_return out;
         }
+        // anthropic 风格错误（{"type":"error",...}，无 code 字段——此前被当成功/被无视）：
+        // 请求级问题（如 [1261] prompt is too long），换账号无用且每个账号重传大 body 要 30-60s——快速失败
+        if (j.is_object() && (j.value("type", std::string()) == "error" || j.contains("error"))) {
+          util::log("upstream anthropic-style error (status=" + std::to_string(res.status) + "): " +
+                    res.body.substr(0, 300));
+          out.status = res.status; out.content_type = res.content_type; out.body = res.body;
+          out.business_error = nlohmann::json{
+              {"code", -1},
+              {"msg", j.contains("error") && j["error"].is_object()
+                          ? j["error"].value("message", j.dump())
+                          : j.dump()}};
+          co_return out;
+        }
+      }
+      if (on_chunk && !sse) {
+        // 流式请求收到 2xx 非 SSE 响应 = 失败，绝不冒充成功（此前 33MB 大请求被上游以
+        // JSON/空体拒绝时，这里直接落成功路径发出 0 帧 [DONE]，客户端只见空回复/断流）
+        util::log("upstream non-stream response (status=" + std::to_string(res.status) +
+                  " content_type=" + res.content_type + ") body=" + res.body.substr(0, 300));
+        had_status = res.status;
+        last_content_type = res.content_type;
+        last_body = res.body;
+        continue; // 空/无法识别：换下一个账号
       }
       out.status = res.status;
       out.content_type = res.content_type;
@@ -249,6 +300,7 @@ public:
     }
     out.status = had_status;
     out.content_type = last_content_type;
+    out.body = last_body;
     co_return out;
   }
 

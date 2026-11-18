@@ -23,7 +23,7 @@ struct Config {
   nlohmann::json env_model_map; // ZPROXY_MODEL_MAP（可能为 null）
   // 上游
   std::string upstream = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
-  std::string app_version = "3.16.3";
+  std::string app_version = "3.17.1"; // 对齐真实客户端（3.16.3 拿不到按版本投放的 marketing 活动，如 300M token GLOBAL BUILD）
   // 冷却/重试
   int64_t cooldown_401_ms = 10 * 60 * 1000;
   int64_t cooldown_429_ms = 60 * 1000;

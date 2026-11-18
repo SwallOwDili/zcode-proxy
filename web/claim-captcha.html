@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>手动领取活动套餐 · zcode-proxy</title>
+<link rel="stylesheet" href="/admin/assets/app.css">
+<style>
+  .claim-card { max-width: 720px; margin: 40px auto; padding: 24px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); }
+  .claim-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .claim-row:last-child { border-bottom: 0; }
+  .claim-name { font-weight: 600; min-width: 140px; }
+  .claim-plan { flex: 1; font-size: 13px; color: var(--muted, #888); }
+  .claim-ok { color: #16a34a; font-weight: 600; }
+  .claim-err { color: #dc2626; font-weight: 600; }
+  #captcha-element { margin: 12px 0; }
+</style>
+</head>
+<body>
+<div class="toast" id="toast"></div>
+<script src="/admin/assets/app.js"></script>
+<div class="claim-card">
+  <h2>🎁 领取活动套餐（需浏览器验证）</h2>
+  <div class="hint">上游要求领取请求携带浏览器环境生成的人机验证参数（与官方客户端同一 SDK）。逐账号静默验证并提交，通常无需人工操作。</div>
+  <button id="refreshBtn" class="primary" onclick="loadOpp()">扫描可领活动</button>
+  <button id="allBtn" onclick="claimAll()" style="display:none">全部领取</button>
+  <div id="rows" style="margin-top:12px"></div>
+  <div id="captcha-element"></div>
+  <button id="captcha-button" style="display:none">触发验证</button>
+</div>
+<script>
+let opps = [];
+let capCfg = null;
+let sdkReady = null;
+function toast(msg, isErr) {
+  const t = document.getElementById("toast");
+  t.textContent = msg; t.style.display = "block";
+  t.style.background = isErr ? "#7f1d1d" : "#14532d";
+  setTimeout(() => { t.style.display = "none"; }, 6000);
+}
+async function loadCfg() {
+  if (capCfg) return capCfg;
+  try { const r = await fetch("/admin/captcha-config"); if (r.ok) capCfg = await r.json(); } catch {}
+  return capCfg;
+}
+function loadSdk() {
+  if (sdkReady) return sdkReady;
+  sdkReady = loadCfg().then(cfg => new Promise((resolve, reject) => {
+    window.AliyunCaptchaConfig = { region: cfg?.region ?? "sgp", prefix: cfg?.prefix ?? "no8xfe" };
+    const s = document.createElement("script");
+    s.src = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
+    s.async = true;
+    s.onload = resolve; s.onerror = () => reject(new Error("验证码 SDK 加载失败"));
+    document.head.appendChild(s);
+  }));
+  return sdkReady;
+}
+// 每次领取都在独立 iframe 里跑一遍 SDK：SDK 的实例状态在 JS 内，同页重复 init 会复用失效实例
+//（实测：同页连续领，第 1 个成功、之后全 3007；重载页面/新上下文后又能成功）
+function verifyOnce() {
+  return loadCfg().then(cfg => new Promise((resolve, reject) => {
+    const region = cfg?.region ?? "sgp", prefix = cfg?.prefix ?? "no8xfe", sceneId = cfg?.sceneId ?? "11xygtvd";
+    const frame = document.createElement("iframe");
+    frame.style.cssText = "width:1px;height:1px;border:0;opacity:0;position:fixed;left:-10px;top:-10px";
+    document.body.appendChild(frame);
+    const doc = frame.contentDocument;
+    const html = `<!DOCTYPE html><html><body>
+      <div id="el"></div><button id="btn">go</button>
+      <script>
+        window.AliyunCaptchaConfig = { region: ${JSON.stringify(region)}, prefix: ${JSON.stringify(prefix)} };
+        window.__done = false;
+        window.__emit = function (param) {
+          if (window.__done) return;
+          window.__done = true;
+          parent.postMessage({ __claimCaptcha: true, param: param }, "*");
+        };
+        window.__fail = function (msg) { parent.postMessage({ __claimCaptcha: true, error: msg }, "*"); };
+        var s = document.createElement("script");
+        s.src = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
+        s.onerror = function () { window.__fail("验证码 SDK 加载失败"); };
+        s.onload = function () {
+          window.initAliyunCaptcha({
+            SceneId: ${JSON.stringify(sceneId)},
+            mode: "popup",
+            language: "cn",
+            element: "#el",
+            button: "#btn",
+            getInstance: function () { setTimeout(function () { try { document.getElementById("btn").click(); } catch (e) {} }, 50); },
+            captchaVerifyCallback: function (p) { window.__emit(p); return { captchaResult: true, bizResult: true }; },
+            onBizResultCallback: function () {}
+          });
+        };
+        document.head.appendChild(s);
+      <\/script></body></html>`;
+    doc.open(); doc.write(html); doc.close();
+    let done = false;
+    const cleanup = () => { window.removeEventListener("message", onMsg); frame.remove(); };
+    const onMsg = (ev) => {
+      if (ev.source !== frame.contentWindow) return;
+      const d = ev.data;
+      if (!d || d.__claimCaptcha !== true || done) return;
+      done = true; clearTimeout(timer); cleanup();
+      if (d.error) reject(new Error(d.error)); else resolve(d.param);
+    };
+    window.addEventListener("message", onMsg);
+    const timer = setTimeout(() => { if (done) return; done = true; cleanup(); reject(new Error("验证超时（20s）")); }, 20000);
+  }));
+}
+async function claimOne(item) {
+  const row = document.getElementById("row-" + CSS.escape(item.name));
+  const st = document.getElementById("st-" + CSS.escape(item.name));
+  if (st) st.innerHTML = '<span class="claim-plan">验证中…</span>';
+  try {
+    const param = await verifyOnce();
+    if (st) st.innerHTML = '<span class="claim-plan">提交领取…</span>';
+    const r = await fetch(`/admin/accounts/${encodeURIComponent(item.name)}/claim-plan`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ plan_id: item.plan_id, captchaVerifyParam: param,
+        captcha_region: capCfg?.region ?? "sgp" }),
+    });
+    const j = await r.json();
+    if (j.ok) { if (st) st.innerHTML = '<span class="claim-ok">✅ 已领取</span>'; toast(item.name + " 领取成功"); }
+    else { if (st) st.innerHTML = `<span class="claim-err">❌ ${j.message ?? JSON.stringify(j)}</span>`; toast(item.name + " 领取失败", true); }
+    return j.ok;
+  } catch (e) {
+    if (st) st.innerHTML = `<span class="claim-err">❌ ${e.message}</span>`;
+    return false;
+  }
+}
+async function loadOpp() {
+  const btn = document.getElementById("refreshBtn");
+  btn.disabled = true; btn.textContent = "扫描中…（每账号一次上游查询）";
+  const rows = document.getElementById("rows");
+  rows.innerHTML = '<div class="hint">扫描中…</div>';
+  try {
+    const r = await fetch("/admin/claim/opportunities");
+    const j = await r.json();
+    opps = j.items ?? [];
+    if (!opps.length) { rows.innerHTML = '<div class="hint">当前没有账号有可领取的活动投放（可能已领过或活动未投放到这些账号）。</div>'; return; }
+    rows.innerHTML = opps.map((it, i) => `
+      <div class="claim-row" id="row-${CSS.escape(it.name)}">
+        <span class="claim-name">${it.name}</span>
+        <span class="claim-plan">${it.plan_name ?? ""} ${it.show_name ?? ""} ${(it.grant_units ?? 0).toLocaleString()} tokens · ${it.plan_id}</span>
+        <span id="st-${CSS.escape(it.name)}"></span>
+        <button data-i="${i}">领取</button>
+      </div>`).join("");
+    rows.querySelectorAll("button[data-i]").forEach(b =>
+      b.addEventListener("click", () => claimOne(opps[+b.dataset.i])));
+    document.getElementById("allBtn").style.display = "";
+  } finally {
+    btn.disabled = false; btn.textContent = "扫描可领活动";
+  }
+}
+async function claimAll() {
+  const all = document.getElementById("allBtn");
+  all.disabled = true;
+  for (const it of opps) {
+    const st = document.getElementById("st-" + CSS.escape(it.name));
+    if (st && st.querySelector(".claim-ok")) continue; // 已成功跳过
+    await claimOne(it);
+    await new Promise(r => setTimeout(r, 2500)); // 参数单次有效且限速 8s，逐个来
+  }
+  all.disabled = false;
+}
+</script>
+</body>
+</html>
